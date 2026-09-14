@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+repos/
+.direnv/
+shell.nix
+scp.py
+test.py
+.envrc
+stellar-core/

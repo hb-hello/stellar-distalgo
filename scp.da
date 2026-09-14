@@ -1,0 +1,656 @@
+# type: ignore
+## above comment for pylance to stop linting this as Python code
+
+# Source : https://8130068.fs1.hubspotusercontent-na1.net/hubfs/8130068/stellar-consensus-protocol.pdf
+
+# comments copied from original scp paper, except p' is replaced with p2, and ~ ...
+#s copied from simplied paper...
+#c copied from cpp from github....
+#p copied from sosp 2019 
+#? questions
+## our own comments, e.g., needed to run, chose @s vs #c
+
+import time
+import hashlib
+from itertools import combinations
+from utils import hash_msg
+
+QUORUM_CONFIG = {
+    # k-of-k2-of-n structurehow
+    # Top-tier nodes: each trusts any 3 members of the top tier (including itself)
+    'alice': {'threshold': 1, 'slices': [{'threshold': 3, 'validators': {'alice', 'bob', 'carol', 'dave'}}]},
+    'bob':   {'threshold': 1, 'slices': [{'threshold': 3, 'validators': {'alice', 'bob', 'carol', 'dave'}}]},
+    'carol': {'threshold': 1, 'slices': [{'threshold': 3, 'validators': {'alice', 'bob', 'carol', 'dave'}}]},
+    'dave':  {'threshold': 1, 'slices': [{'threshold': 3, 'validators': {'alice', 'bob', 'carol', 'dave'}}]},
+
+    # Second-tier nodes: each trusts any 2 members of the top tier
+    'eve':   {'threshold': 1, 'slices': [{'threshold': 2, 'validators': {'alice', 'bob', 'carol', 'dave'}}]},
+    'frank': {'threshold': 1, 'slices': [{'threshold': 2, 'validators': {'alice', 'bob', 'carol', 'dave'}}]},
+    'grace': {'threshold': 1, 'slices': [{'threshold': 2, 'validators': {'alice', 'bob', 'carol', 'dave'}}]},
+    'heidi': {'threshold': 1, 'slices': [{'threshold': 2, 'validators': {'alice', 'bob', 'carol', 'dave'}}]},
+
+    # Third-tier nodes: each trusts any 2 members of the second tier
+    'ivan':  {'threshold': 1, 'slices': [{'threshold': 2, 'validators': {'eve', 'frank', 'grace', 'heidi'}}]},
+    'judy':  {'threshold': 1, 'slices': [{'threshold': 2, 'validators': {'eve', 'frank', 'grace', 'heidi'}}]},
+}
+
+TIMEOUT = 1
+INFINITY = 2 ** 31  ## A large number to represent infinity for ballot counters
+
+# Nodes then deterministically combine these candidates into a single composite value
+# for the slot. Exactly how to combine values depends on the application
+## to be defined based on application later on
+def combine(values:set):
+  return frozenset(values)
+
+# When a node hears a sufficient
+# set of nodes assert a statement, it assumes no functioning node will ever contradict
+# that statement. We call such a sufficient set a quorum slice, or, more concisely, just a
+# slice. To permit progress in the face of node failures, a node may have multiple slices,
+# any one of which is sufficient to convince it of a statement
+## v is the node id of the node whose quorum we're testing i.e. self
+## D is the quorum config of the node v
+## we want to check if the nodes in selected_validators satisfy a quorum slice for node v
+def is_quorum_slice(v, D, selected_validators):
+  if v not in selected_validators or D is None: return False
+  t, s = D
+  return lenof((threshold, validators), (threshold, validators) in s, len(validators & selected_validators) >= threshold) >= t
+
+# Definition (quorum). A set of nodes U ⊆ V in FBAS ⟨V, Q⟩ is a quorum iff U ≠ <empty set> and
+# U contains a slice for each member—i.e., ∀v ∈ U , ∃q ∈ Q(v) such that q ⊆ U.
+## check if node v is part of a quorum of nodes in U
+## U is the set of pairs with node ids and their quorum configs
+def is_in_quorum(v, U):
+  ##
+  #c remove all nodes from U that do not have their quorum slice satisfied in U, g
+  #c and converge on a self-sufficient quorum set (if v gets removed fail early)
+  ##
+  nodes = {node for (node, _) in U}
+  while(v in nodes):
+    to_remove = setof(n, (n, D) in U, not is_quorum_slice(n, D, setof(n1, (n1, _) in U)))
+    if not to_remove: break
+    else: 
+      for n2 in to_remove: nodes.discard(n2)
+  return v in nodes
+
+def is_blocking(D, selected_validators:set):
+  t, s = D
+  # Definition (v-blocking). Let v ∈ V be a node in FBAS ⟨V, Q⟩. A set B ⊆ V is v-blocking
+  # iff it overlaps every one of v’s slices—i.e., ∀q ∈ Q(v), q ∩ B ≠ ∅.
+  ## A slice (threshold, validators) is blocked by set of nodes B when len(validators & B) > len(validators) - threshold
+  ## i.e. B has captured enough validators that the remaining non-B validators cannot meet threshold alone.
+  return lenof(s, (threshold, validators) in s, len(validators & selected_validators) > len(validators) - threshold) > len(s) - t
+
+# Let gi(m) = H(i, xi−1, m) be a slot-specific hash
+# function for slot i, where xi−1 is the value chosen for the slot preceding i (or the sorted
+# set of values of all immediate dependencies of slot i when slots are governed by a par-
+# tial order).
+def gi(i, xi_minus_1, m):
+  # For simplicity, we can use a hash of the concatenation of the inputs as a placeholder for the slot-specific hash function.
+  # In a real implementation, this should be a secure hash function that takes into account the specific requirements of the protocol.
+  input_str = f"{i}:{xi_minus_1}:{m}"
+  return hashlib.sha256(input_str.encode()).hexdigest()
+
+def nCr(n, r):
+  if r > n or r < 0: return 0
+  if r == 0 or r == n: return 1
+  r = min(r, n - r)
+  result = 1
+  for i in range(r):
+    result *= (n - i) // (i + 1)
+  return result
+
+def weight(D, v):
+  threshold, slices = D
+  # weight(v, v2) = |{q | q ∈ Q(v) & v2 ∈ q}| / |Q(v)|
+  # The function weight (v, v2) returns the fraction of slices in Q(v) containing v2
+  total = with_v = 0
+  for combo in combinations(slices, threshold):
+    p = 1
+    for s in combo: p *= nCr(len(s[1]), s[0])
+    total += p
+    if any(v in s[1] for s in combo):
+      q = 1
+      for s in combo: q *= nCr(len(s[1])-1, s[0]-1) if v in s[1] else nCr(len(s[1]), s[0])
+      with_v += q
+  return with_v / total if total > 0 else 0
+
+def neighbors(D, n, i):
+  threshold, slices = D
+  # neighbors(v, n) = { v2 | gi(N, n, v2) < h_max * weight(v, v2) }
+  h_max = 2 ** 256  # Maximum value for a 256-bit hash
+  N = 1 # N and P are constants to produce two different hash functions.
+  all_validators = setof(v, (_, s) in slices, v in s)
+  return setof(v2, v2 in all_validators, int(gi(i, 0, f"{N}:{n}:{v2}"), 16) < h_max * weight((threshold, slices), v2)) ## pass 0 in place of xi_minus_1 for now
+
+def priority(n, v2):
+  # priority(n, v2) = gi(P, n, v2)
+  P = 2 # N and P are constants to produce two different hash functions.
+  return int(gi(P, 0, f"{P}:{n}:{v2}"), 16) ## pass 0 in place of xi_minus_1 for now
+
+def max_priority_neighbor(D, n, i):
+  neighbors_set = neighbors(D, n, i)
+  if not neighbors_set:
+    return None
+  return max((priority(n, v2), v2) for v2 in neighbors_set)[1]
+
+## helper method to extract relevant message fields to order messages
+# All messages sent by a particular node are totally ordered by ⟨phi, b, p, p2, h⟩, with phi
+# the most significant and h the least significant field. The values of these fields can be
+# determined from messages, as described in Figure 17.
+def extract_fields(msg):
+    msg_type = msg[0]
+
+    # Define phi ordering: PREPARE < CONFIRM < EXTERNALIZE
+    phi_order = {'PREPARE': 0, 'CONFIRM': 1, 'EXTERNALIZE': 2}
+
+    # Extract fields based on message type (default to 0 if not present)
+    if msg_type == 'PREPARE':
+      # PREPARE v i b p p2 c.n h.n D
+      phi = phi_order['PREPARE']
+      b = msg[3] if len(msg) > 3 else Ballot(0, None)
+      p = msg[4] if len(msg) > 4 else Ballot(0, None)
+      p2 = msg[5] if len(msg) > 5 else Ballot(0, None)
+      h_n = msg[7] if len(msg) > 7 else 0
+      h = Ballot(h_n, b.x) if h_n != 0 else Ballot(0, None)
+
+    elif msg_type == 'CONFIRM':
+      # CONFIRM v i b p.n c.n h.n D
+      phi = phi_order['CONFIRM']
+      b = msg[3] if len(msg) > 3 else Ballot(INFINITY, None)
+      p_n = msg[4] if len(msg) > 4 else 0
+      p = Ballot(p_n, b.x) if p_n != 0 else Ballot(0, None)
+      p2 = Ballot(0, None)  # p2 = 0 for CONFIRM
+      h_n = msg[6] if len(msg) > 6 else 0
+      h = Ballot(h_n, b.x) if h_n != 0 else Ballot(0, None)
+
+    elif msg_type == 'EXTERNALIZE':
+      # EXTERNALIZE v i x c.n h.n D
+      phi = phi_order['EXTERNALIZE']
+      x = msg[3] if len(msg) > 3 else None
+      b = Ballot(INFINITY, x)
+      p = Ballot(INFINITY, x)
+      p2 = Ballot(0, None)  # p2 = 0 for EXTERNALIZE
+      h_n = msg[5] if len(msg) > 5 else INFINITY
+      h = Ballot(h_n, x)
+    else:
+      ## Unknown message type, return minimum values
+      phi = -1
+      b = p = p2 = h = Ballot(0, None)
+
+    return (phi, b, p, p2, h)
+
+class Ballot:
+  # A ballot b is a pair of the
+  # form b = ⟨n, x⟩, where x != ⊥ is a value and b is a referendum on externalizing x for
+  # the slot in question. The value n ≥ 1 is a counter to ensure higher ballot numbers
+  # are always available. We use C-like notation b.n and b.x to denote the counter and
+  # value fields of ballot b, so that b = ⟨b.n, b.x⟩. Ballots are totally ordered, with b.n
+  # more significant than b.x. For convenience, a special invalid null ballot 0 = ⟨0, ⊥⟩
+  # is less than all other ballots, and a special counter value infinity is greater than all other
+  # counters.
+  #? ⊥ ??
+  def __init__(self, n=0, x=''):
+    self.n = n
+    self.x = x
+
+  def __hash__(self):
+    return hash((self.n, self.x))
+
+  def __repr__(self):
+    return f"Ballot(n={self.n}, x={self.x})"
+
+  ## Adding logic for comparing ballots as Python does not allow object comparisons by default
+  def __lt__(self, other):
+    if self.n < other.n:
+      return True
+    elif self.n == other.n:
+      return self.x < other.x
+    else:
+      return False
+
+  def __eq__(self, other):
+    return self.n == other.n and self.x == other.x
+
+  def __gt__(self, other):
+    return not self == other and not self < other
+
+  # Definition (compatible). Two ballots b1 and b2 are compatible, written b1 ∼ b2, iff
+  # b1.x = b2.x and incompatible, written b1 ≁ b2, iff b1.x ≠ b2.x. We also write b1 ≲ b2 or
+  # b2 ≳ b1 iff b1 ≤ b2 (or equivalently b2 ≥ b1) and b1 ∼ b2.
+  # Similarly, b1 ⋦ b2 or b2 ⋧ b1 means b1 ≤ b2 (or equivalently b2 ≥ b1) and b1 ≁ b2
+
+  def lt_c(self, other):
+    return self.n <= other.n and self.x == other.x
+
+  def gt_c(self, other):
+    return self.n >= other.n and self.x == other.x
+
+  def lt_nc(self, other):
+    return self.n <= other.n and self.x != other.x
+
+  def gt_nc(self, other):
+    return self.n >= other.n and self.x != other.x
+
+class State:
+  def __init__(self, slot:int, D:tuple):
+
+    self.slot = slot  ## The slot number this state corresponds to
+    self.n = 0 ## the nomination round for this slot #? when do we increment this?
+
+    # Fig. 14. Nomination state maintained by node v for each slot
+    self.X = set()  # The set of values v has voted to nominate
+    self.Y = set()  # The set of values v has accepted as nominated
+    self.Z = set()  # The set of values v considers candidate values
+    self.N = set()  # The set of the latest nomination message received from each node ## map indexed on node id
+    self.v_n = max_priority_neighbor(D, self.n, self.slot) ## the neighbor with the max priority - recalculated every time nomination round changes
+    self.nomination_loop_activated = False  ## flag to indicate whether the nomination loop is active for this slot
+    # All four fields are initialized to the empty set.
+
+
+    # Fig. 16. Ballot state maintained by each node v for each slot
+    self.phi = 'PREPARE' # Current phase: one of PREPARE, CONFIRM, or EXTERNALIZE
+    self.b = Ballot() # Current ballot that node v is attempting to prepare and commit (b != 0)
+    self.p2, self.p = Ballot(), Ballot()  # The twohighest ballots accepted as prepared such that p2 <!~ p,
+                            # where p2 = 0 or p = p2 = 0 if there are no such ballots #? what is ~
+    self.c, self.h = Ballot(), Ballot()
+            # In PREPARE :h is the highest ballot confirmed as prepared, or 0 if none;
+            # if c != 0, then c is lowest andh the highest ballot for which
+            # vhas voted 'commit' and not accepted 'abort'.
+            # In CONFIRM : lowest,highest ballot for which v accepted 'commit'
+            # In EXTERNALIZE : lowest, highest ballot for which v confirmed 'commit'
+            # Invariant: if c != 0, then c <~h <~ b.
+    self.z = None  # Value to use in next ballot. If h = 0, then z is the composite value (see
+                # Section 6.1); otherwise, z = h.x. #? init with None
+    self.M = set() # Set of the latest ballot message seen from each node - the latest message received from each node #?should be a map indexed on node id
+    self.votes = set() ## set of conceptual statements based on messages
+
+    # Each node initializes its slot state by setting phi to PREPARE, b to ⟨0, z⟩,
+    # M to empty set, and all other fields (p, p2, c, h) to invalid ballot 0.
+
+  def add_nomination(self, v, X, Y, D):
+    # Because X and Y grow monotonically over time, it is possible to determine which of mul-
+    # tiple NOMINATE messages from the same node is the latest, independent of network delivery order
+    ## return true if the nomination message is new and should be processed, false otherwise
+    existing_msg = next((m for m in self.N if m[1] == v), None)
+    if existing_msg is None:
+      self.N.add((v, frozenset(X), frozenset(Y), D))
+      return True
+    else:
+      if len(existing_msg[1]) < len(X) or len(existing_msg[2]) < len(Y):
+        self.N.discard(existing_msg)
+        self.N.add((v, frozenset(X), frozenset(Y), D))
+        return True
+    return False
+
+  def increment_n(self, D=None):
+    self.n += 1
+    self.v_n = max_priority_neighbor(D, self.n, self.slot) if D is not None else None
+
+  def add_message(self, msg):
+    # All messages sent by a particular node are totally ordered by ⟨phi, b, p, p2, h⟩, with phi
+    # the most significant and h the least significant field. The values of these fields can be
+    # determined from messages, as described in Figure 17. All PREPARE messages precede
+    # all CONFIRM messages, which in turn precede the single EXTERNALIZE message for a
+    # given slot. The ordering makes it possible to ensure M contains only the latest ballot from
+    # each node without relying on timing to order the messages, since the network may re-order messages.
+    ## return true if the message is new and should be processed, false otherwise
+    sender = msg[1]
+    phi, b, p, p2, h = extract_fields(msg)
+    existing_msg = next((m for m in self.M if m[1] == sender), None)
+
+    if existing_msg is None:
+      self.M.add(msg)
+      return True
+    else:
+       if (phi, b, p, p2, h) < extract_fields(existing_msg):
+         self.M.discard(existing_msg)
+         self.M.add(msg)
+         return True
+    return False
+
+class Node(process):
+  def setup(D:tuple):
+    # D is node v’s quorum slice Q(v) or a collision-resistant hash of Q(v)
+    self.state_per_slot = dict()  ## To maintain the state per slot #? should this be a set instead of dict?
+    ## map of peers (node ids and their quorum config) based on quorum slices
+    self.peers = {}
+    for node in setof(n, (_, v) in D[1], n in v):
+      self.peers[node] = None
+    self.peers[self] = D
+    self.gossip_known = {}
+    output(f'Node {self} initialized with quorum slices: {D} and peers: {self.peers}')
+
+  def send(msg, to, debugOnly=False):
+    # output(f'gossip state for {msg}: {self.gossip_known.get(hash(msg), {})}')
+    to = to - self.gossip_known.setdefault(hash_msg(msg), set())
+    self.gossip_known[hash_msg(msg)] |= to
+    output(f'Sending message: {msg} to peers: {to}')
+    if not debugOnly: super().send(msg, to=to)
+
+  def receive(msg=m):
+    output(f'received a message: {m}')
+
+  def receive(msg=('TRANSACTION', i, value)):
+    # This is a message from a client adding a value for slot i.
+    state = self.state_per_slot.setdefault(i, State(i, self.D)) ## retrieve or initialize the state for mentioned slot
+    if self == state.v_n:
+      if update_nomination_state(state):
+        send_nomination(state)
+        trigger_nomination_timeout(state) ## trigger nomination loop to start incrementing nomination rounds till a value is confirmed
+
+  def send_nomination(state:State):
+    # NOMINATE v i X Y D
+    # This is a message from node v nominating values for slot i. D is v’s quorum
+    # slice Q(v) or a collision-resistant hash of Q(v). X and Y are from v’s state.
+
+    # Only one remote procedure call (RPC) is needed for nomination - the argument is the
+    # sender’s latest NOMINATE message and the return value is the receiver’s.
+    state.add_nomination(self, frozenset(state.X), frozenset(state.Y), self.D)
+    msg = ('NOMINATE', self, state.slot, state.X, state.Y, self.D)
+    send(msg, to=self.peers.keys() - {self})
+    # highest-priority node can optimistically initiate balloting at the same time as nom-
+    # ination, piggybacking its first ballot message PREPARE (described below) on its first
+    # NOMINATE message.
+    send_message(state)
+
+  def trigger_nomination_timeout(state:State):
+    ## only trigger nomination loop once for a particular slot 
+    if not state.nomination_loop_activated:
+      state.nomination_loop_activated = True
+      while(state.nomination_loop_activated):
+        # v should use timeouts to decide on new nominate statements to vote for. After n timeouts, v should
+        # find a node v_n ∈ neighbors(v, n) maximizing priority(n, v_n) and vote to nominate every-
+        # thing v_n has voted to nominate
+        ## keep trying to nominate new values by incrementing the round number (n)
+        #? each slot will have its own while loop running
+        # As soon as v has a candidate value, however, it must cease voting to nominate x
+        # for any new values x
+        if await(state.Z):
+          break
+        elif timeout(TIMEOUT):
+          if state.X: ## do nothing if there is no nominate statement to vote for
+            state.increment_n() ## increment nomination round number for this slot
+            if update_nomination_state(state): send_nomination(state) ## send nomination request message to peers for this slot based on updated n
+
+  def update_nomination_state(state:State):
+    # Each node v should initially find a node v0 ∈ neighbors(v, 0) that maximizes
+    # priority(0, v0) among nodes it can communicate with, then vote to nominate the same
+    # values as v0. Only if v = v0 should v introduce a new value to nominate.
+    ## new value to nominate is picked from transactions received
+    if state.v_n == self:
+      state.X |= setof(x, received(('TRANSACTION', state.slot, x))) ## adding new values to vote for nominations
+    else:
+      state.X |= setof(x, ('nominate', state.v_n, x) in state.votes) ## echoing current leader's nominate votes
+      #? distalgo question for above: I want to filter out triples in state.votes with the middle value equal to state.v_n but 
+      #? in this case I don't need to write it like _state.v_n?
+    state.votes |= setof(('nominate', self, x), x in state.X)
+
+    ## check if X was updated
+    updated = False
+    if state.add_nomination(self, frozenset(state.X), frozenset(state.Y), self.D): updated = True
+
+    ## move values from X to Y based on federated voting
+    nominate_votes = setof((v, x), ('nominate', v, x) in state.votes)
+    accept_nominate_votes = setof((v, x), ('accept_nominate', v, x) in state.votes)
+
+    for x1 in setof(x, (_, x) in nominate_votes, x not in state.Y):
+      if is_in_quorum(self, setof((v, peers.get(v)), v in setof(v1, (v1, _x1) in nominate_votes) | setof(v2, (v2, _x1) in accept_nominate_votes))) or is_blocking(D, setof(v, (v, _x1) in accept_nominate_votes)):
+        state.Y.add(x1)
+        state.votes.add(('accept_nominate', self, x1)) ## add own accept_nominate vote for x1
+        updated = True
+
+    # A node v considers a value x to be a candidate when v has
+    # confirmed the statement nominate x—i.e., v has ratified accept (nominate x).
+    ## move values from Y to Z based on candidate criteria
+    for x2 in setof(x, (_, x) in accept_nominate_votes, x not in state.Z):
+      if x2 in state.Y and is_in_quorum(self, setof((v, peers.get(v)), v in setof(v1, (v1, _x2) in accept_nominate_votes))):
+        state.Z.add(x2)
+        updated = True
+    
+    return updated
+
+  def receive(msg=('NOMINATE', sender, i, X, Y, D)):
+    state = self.state_per_slot.setdefault(i, State(i, self.D)) ## retrieve the state for mentioned slot
+
+    peers[sender] = D
+    gossip_known.setdefault(hash_msg(('NOMINATE', sender, i, X, Y, D)), set()).add(sender)
+
+    for node in setof(n, (_, v) in D[1], n in v): ## update peers based on quorum slices of received nomination message
+      peers.setdefault(node, None)
+
+    ## Ignore if this is not a new nomination message
+    if not state.add_nomination(sender, X, Y, D): return
+
+    #? consider moving below votes addition to state.add_nomination
+    # This concrete message encodes the following conceptual messages:
+    # — { nominate x ∣ x ∈ X } (votes to nominate each value in X)
+    for x in X:
+      state.votes.add(('nominate', sender, x))
+      # if can_nominate:
+      #   state.X.add(x) ## add value to X values for this slot
+      #   state.votes.add(('nominate', self, x)) ## add own nominate vote for this value
+    # — { accept (nominate x) ∣ x ∈ Y } (votes to confirm nominations in Y)
+    for y in Y:
+      state.votes.add(('accept_nominate', sender, y))
+
+    #c nodes broadcast their state whenever there is an update in state
+    if update_nomination_state(state):
+      send_nomination(state)
+      trigger_nomination_timeout(state)
+
+
+  # Fig. 17. Messages in SCP’s ballot protocol
+
+  def send_message(state):
+    # Because nodes cannot tell when the nomination protocol is complete anyway, SCP
+    # must cope with different composite values at different nodes. As an optimization, then,
+    # nodes can attempt to predict the final composite value before they even have a candi-
+    # date value. To do this, the composite value can be taken as combine(Z) when Z ≠ <empty set>,
+    # otherwise combine(Y) when Y ≠ <empty set>, otherwise combine(X) when X ≠ <empty set>. This means the
+    # highest-priority node can optimistically initiate balloting at the same time as nom-
+    # ination, piggybacking its first ballot message PREPARE (described below) on its first
+    # NOMINATE message.
+    state.z = combine(state.Z) if state.Z else (combine(state.Y) if state.Y else combine(state.X))
+
+    # Once z ≠ ⊥, if b.n = 0, a node
+    # reinitializes b to ⟨1, z⟩ to start sending messages. Nodes then repeatedly exchange
+    # messages with peers, sending whichever ballot message is indicated by phi.
+    if not state.z: return
+    if state.b.n == 0:
+      state.b = Ballot(n=1, x=state.z)
+
+    if state.phi == 'PREPARE':
+      # PREPARE v i b p p2 c.n h.n D
+      # This is a message from node v about slot i. D specifies Q(v). The other fields
+      # reflect v’s state. Values c.x and h.x are elided as c.x = h.x = b.x when c.n ≠ 0.
+      state.add_message(('PREPARE', self, state.slot, state.b, state.p, state.p2, state.c.n, state.h.n, self.D))
+      send(('PREPARE', self, state.slot, state.b, state.p, state.p2, state.c.n, state.h.n, self.D), to=self.peers.keys() - {self})
+
+    elif state.phi == 'CONFIRM':
+      # CONFIRM v i b p.n c.n h.n D
+      # Sent by v to try to externalize b.x for slot i after accepting a commit. Implies
+      # p.x = c.x = h.x = b.x in v’s state. For convenience, we also say p2 = 0 (p2 is
+      # irrelevant after accepting commit). D specifies Q(v) as above.
+      state.add_message(('CONFIRM', self, state.slot, Ballot(n=INFINITY, x=state.b.x), state.p.n, state.c.n, state.h.n, self.D))
+      send(('CONFIRM', self, state.slot, Ballot(n=INFINITY, x=state.b.x), state.p.n, state.c.n, state.h.n, self.D), to=self.peers.keys() - {self})
+
+    elif state.phi == 'EXTERNALIZE':
+      # EXTERNALIZE v i x c.n h.n D
+      # After v confirms commit ⟨c.n,x⟩ for slot i and externalizes value x, this
+      # message helps other nodes externalize x. Implies c = ⟨c.n, x⟩ and h = ⟨h.n, x⟩.
+      # For convenience, we also say b = p = h = ⟨infinity, x⟩, and p2 = 0.
+      state.add_message(('EXTERNALIZE', self, state.slot, state.b.x, state.c.n, state.h.n, self.D))
+      send(('EXTERNALIZE', self, state.slot, state.b.x, state.c.n, state.h.n, self.D), to=self.peers.keys() - {self})
+
+  def receive(msg=('PREPARE', v, i, b, p, p2, c_n, h_n, D)):
+    state = self.state_per_slot.setdefault(i) ## retrieve the state for mentioned slot
+    statements = set()
+
+    gossip_known.setdefault(hash_msg(('PREPARE', v, i, b, p, p2, c_n, h_n, D)), set()).add(v)
+
+    if not state.add_message(('PREPARE', v, i, b, p, p2, c_n, h_n, D)): return ## Ignore if this is not a new message
+
+    # This concrete message encodes a host of conceptual statements, as follows:
+    # — {abort b2 ∨ accept(abort b2 ) ∣ b2 ⋦ b} (a vote to prepare b)
+    statements.update({('abort', v, b2) for b2 in setof(ballot, ('accept_abort', _, ballot) in state.votes, ballot.lt_nc(b))}) #? Do we check in accept statements from all nodes?
+    # — {accept(abort b2 ) ∣ b2 ⋦ p} (a vote to confirm p is prepared)
+    if p.n != 0: statements.update({('accept_abort', v, Ballot(n=b2, x=p.x)) for b2 in range(0, p.n)})
+    # — {accept(abort b2 ) ∣ b2 ⋦ p2 } (a vote to confirm p2 is prepared)
+    if p2.n != 0: statements.update({('accept_abort', v, Ballot(n=b2, x=p2.x)) for b2 in range(0, p2.n)})
+    # — {commit b2 ∣ c.n ≠ 0 ∧ c ≲ b2 ≲h} (a vote to commit c,…,ℎ if c ≠ 0)
+    if c_n != 0: statements.update({('commit', v, Ballot(n=b2, x=b.x)) for b2 in range(c_n, h_n+1)})
+
+    state.votes.update(statements)
+
+    update_state(i) ## update state based on new statements
+
+    ## received a message from v with a vote to prepare b,
+    ## a vote to confirm p and p2 are prepared which means that v is claiming to accept p and p2
+    ## a vote to commit c,...,h if c != 0, which means that v is claiming to accept c,...,h are prepared
+
+
+  def receive(msg=('CONFIRM', v, i, b, p_n, c_n, h_n, D)):
+    state = self.state_per_slot.setdefault(i) ## retrieve the state for mentioned slot
+    statements = set()
+    
+    gossip_known.setdefault(hash_msg(('CONFIRM', v, i, b, p_n, c_n, h_n, D)), set()).add(v)
+    # Encodes:
+    # — Everything implied by PREPARE v i ⟨infinity,b.x⟩ p 0 c.n infinity D
+    statements.update({('abort', v, b2) for b2 in setof(ballot, ('accept_abort', _, ballot) in state.votes, ballot.x != b.x)})
+    if p_n != 0: statements.update({('accept_abort', v, Ballot(n=b2, x=b.x)) for b2 in range(0, p_n)})
+    if c_n != 0:
+      statements.update({('commit', v, Ballot(n=b2, x=b.x)) for b2 in range(c_n, h_n+1)})
+      statements.update({('commit', v, Ballot(n=INFINITY, x=b.x))}) ## add a single infinity record to represent all commits upto inifinity
+    # — {accept(commit b2 ) ∣ c ≲ b2 ≲h} (a vote to confirm commit c,…, h)
+    statements.update({('accept_commit', v, Ballot(n=b2, x=b.x)) for b2 in range(c_n, h_n+1)})
+    state.votes.update(statements)
+
+    update_state(i) ## update state based on new statements
+
+  ### def receive(msg=('EXTERNALIZE', v, i, x, c_n, h_n, D)):
+  ###   state = self.state_per_slot.setdefault(i) ## retrieve the state for mentioned slot
+  ###   statements = set()
+  ###   # Encodes:
+  ###   # — Everything implied by CONFIRM v i ⟨infinity, x⟩ infinity c.n infinity D
+  ###   # — Everything implied by CONFIRM v i ⟨infinity, x⟩ infinity c.n h.n {{v}}
+
+
+  def update_state(i:int):
+    state = self.state_per_slot.setdefault(i) ## retrieve the state for mentioned slot
+
+    if state.phi == 'PREPARE':
+      # (1) If phi = PREPARE and m lets v accept new ballots as prepared, update p and p2.
+      # Afterwards, if either p ⋧ h or p2 ⋧ h, then set c to 0
+
+      # Definition (accept). An FBAS node v accepts a statement a iff it has never accepted
+      # a statement contradicting a and it determines that either
+      # (1) There exists a quorum U such that v ∈ U and each member of U either voted for
+      # a or claims to accept a, or
+      # (2) Each member of a v-blocking set claims to accept a.
+
+      # Definition (prepared). A ballot b is prepared iff every statement in the following set
+      # is true: { abort b_old ∣ b_old ⋦ b }
+
+      ## highest b for which we have either a quorum of abort votes or a v-blocking set of abort votes for all b_old ⋦ b
+      highest_aborted_ballot = max(setof(b, (_, _, b) in state.votes),
+                                          is_quorum_slice(self, D, setof(v, ('abort', v, _b) in state.votes)
+                                                      | setof(v, ('accept_abort', v, _b) in state.votes)))
+      if highest_aborted_ballot is None: return #? continue federated voting as no ballot can be accepted prepared
+      ## find the smallest ballot higher than above ballot - this can be accepted as prepared
+      state.p2 = state.p
+      state.p = min(setof(b, (_, _, b) in state.votes, b.gt_nc(highest_aborted_ballot)))
+      if state.p.gt_nc(state.h) or state.p2.gt_nc(state.h):
+        state.c = Ballot()
+        output(f'for slot {i}, set c to 0 due to p or p2 being greater than and not compatible with h')
+
+      # (2) If phi = PREPARE and m lets v confirm new higher ballots prepared, then raise h
+      # to the highest such ballot and set z to h.x.
+      if confirm_condition: #? what is m lets v confirm new higher ballots prepared? some condition on how many prepare messages v receives?
+        h_candidates = [message[7] for message in state.M if message[0] == 'PREPARE' and message[7] > state.h.n]
+        if h_candidates:
+          state.h = Ballot(max(h_candidates), state.b.x)
+          state.z = state.h.x
+          output(f'for slot {i}, raised h to {state.h} and set z to h.x: {state.z}')
+
+      # (3) If phi = PREPARE, c = 0, b ≤ h, and neither p ⋧ h nor p2 ⋧ h, then set c to the lowest
+      # ballot satisfying b ≤ c ≲ h.
+      if state.c.n == 0 and state.b <= state.h and not state.p.gt_nc(state.h) and not state.p2.gt_nc(state.h):
+        state.c = Ballot(n=state.b.n, x=state.b.x)
+
+      # (4) If phi = PREPARE and v accepts commit for one or more ballots, set c to the lowest
+      # such ballot, then set h to the highest ballot such that v accepts all { commit b2 ∣
+      # c ≲ b2 ≲ h }, and set phi to CONFIRM. Also set z to h.x after updating h, and unless
+      # h ≲ b, set b to h.
+      #? what is v accepts commit for one or more ballots? some condition on how many commit messages v receives?
+
+
+    if state.phi == 'CONFIRM':
+      # (5) If phi = CONFIRM and the received message lets v accept new ballots prepared,
+      # raise p to the highest accepted prepared ballot such that p ∼ c.
+      if accept_condition(received(('CONFIRM', _, i, _, _, _, _, _))): #? what is m lets v accept new ballots prepared? some condition on how many confirm messages v receives?
+        #? ...
+        pass
+
+      # (6) If phi = CONFIRM and v accepts more commit messages or raises b, then let h2 be
+      # the highest ballot such that v accepts all { commit b2 ∣ b ≲ b2 ≲ h2 } (if any). If
+      # there exists such an h2 and h2 > h, then set h to h2, and, if necessary, raise c to
+      # the lowest ballot such that v accepts all { commit b2 ∣ c ≲ b2 ≲ h }.
+      #? what is v accepts more commit messages or raises b? some condition on how many commit messages v receives or if b is raised?
+
+      # (7) If phi = CONFIRM and v confirms commit c2 for any c2, set c and h to the lowest and
+      # highest such ballots, set phi to EXTERNALIZE, externalize c.x, and terminate.
+      ## more notes : An SCP node cannot vote to confirm commit b until it has voted to confirm abort for all
+      ## lower-numbered incompatible ballots.
+      #? what is v confirms commit c2 for any c2? some condition on how many commit messages v receives?
+      pass
+
+    # (8) If phi ∈ {PREPARE, CONFIRM} and b < h, then set b to h.
+    if state.phi in ('PREPARE', 'CONFIRM') and state.b < state.h:
+      state.b = state.h
+      output(f'for slot {i}, updated b to h: {state.b}')
+
+    # (9) If phi ∈ {PREPARE, CONFIRM} and ∃S ⊆ Mv such that the set of senders { vm2 ∣
+    # m2 ∈ S } is v-blocking and ∀m2 ∈ S, b_m2.n > b_v.n, then set b to ⟨n, z⟩, where n is
+    # the lowest counter for which no such S exists. Repeat the previous steps after
+    # updating b
+    #? v-blocking condition?
+
+  def run():
+    await(False)
+    # self.send_message(slot)
+
+class Client(process):
+  def setup(nodes:dict):
+    pass
+
+  def run():
+    time.sleep(0.05)
+    send(('TRANSACTION', 1, 'A'), to=nodes['alice'])
+    send(('TRANSACTION', 1, 'B'), to=nodes['bob'])
+    send(('TRANSACTION', 1, 'C'), to=nodes['carol'])
+    send(('TRANSACTION', 1, 'D'), to=nodes['dave'])
+    send(('TRANSACTION', 1, 'E'), to=nodes['eve'])
+    send(('TRANSACTION', 1, 'F'), to=nodes['frank'])
+
+def main():
+
+  all_nodes = new(Node, num=len(QUORUM_CONFIG))
+  nodes = dict(zip(QUORUM_CONFIG.keys(), all_nodes))
+  clients = new(Client, [nodes], num=1)
+
+  output(f'created nodes: {nodes}')
+  for node, config in QUORUM_CONFIG.items():
+    ## Build D as a tuple: (outer_threshold, ((inner_threshold, validators), ...))
+    inner_slices = tuple(
+      (s['threshold'], frozenset(nodes[name] for name in s['validators']))
+      for s in config['slices']
+    )
+    D = (config['threshold'], inner_slices)
+    setup(nodes[node], [D]) ## assuming that nodes start out only knowing the nodes in their quorum config and know no other nodes
+
+  start(nodes.values())
+  start(clients)
+  ## await(False)
+  ## time.sleep(0.2)
+  ## end(all_nodes)
