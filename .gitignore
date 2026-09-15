@@ -7,3 +7,4 @@ scp.py
 test.py
 .envrc
 stellar-core/
+test_results/

@@ -1,0 +1,35 @@
+from utils import hash_msg
+
+class Node(process):
+  def setup(name, debugNames):
+    self.name = name
+    self.debug_names = debugNames  ## maps str(node id) -> node name, so output() can de-anonymize ids in log lines
+    self.peers = {}
+    self.gossip_known = {}
+    self.protocol_messages = set()  ## subclasses override this to the set of message types that should be gossip-tracked
+    output(f'Node {self} initialized')
+
+  def output(s):
+    s = str(s)
+    for pid_str, node_name in self.debug_names.items():
+      s = s.replace(pid_str, node_name)
+    super().output(f'[{self.name}] {s}')
+
+  def send(msg, to, debugOnly=False):
+    if msg[0] in self.protocol_messages:
+      to = to - self.gossip_known.setdefault(hash_msg(msg), set())
+      self.gossip_known[hash_msg(msg)] |= to
+    output(f'Sending message: {msg} to peers: {to}')
+    if not debugOnly: super().send(msg, to=to)
+
+  def receive(msg=m):
+    output(f'received a message: {m}')
+    if m[0] in self.protocol_messages:
+      gossip_known.setdefault(hash_msg(m), set()).add(m[1])
+      sender, D = m[1], m[-1]
+      peers[sender] = D
+      for node in setof(n, (_, v) in D[1], n in v):
+        peers.setdefault(node, None)
+
+  def run():
+    await(False)

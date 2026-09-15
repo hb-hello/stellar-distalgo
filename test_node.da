@@ -1,0 +1,122 @@
+from node import Node
+from utils import hash_msg
+from datetime import datetime
+
+PROTOCOL_MESSAGES = {'NOMINATE'}
+
+## Small 3-node quorum, just enough for the gossip test (alice/bob/carol, 2-of-3 majority)
+QUORUM_CONFIG = {
+  'alice': {'threshold': 1, 'slices': [{'threshold': 2, 'validators': {'alice', 'bob', 'carol'}}]},
+  'bob':   {'threshold': 1, 'slices': [{'threshold': 2, 'validators': {'alice', 'bob', 'carol'}}]},
+  'carol': {'threshold': 1, 'slices': [{'threshold': 2, 'validators': {'alice', 'bob', 'carol'}}]},
+}
+
+class NodeX(process, Node):
+  def setup(checker, name, debugNames):
+    super().setup(name, debugNames)
+    self.protocol_messages = PROTOCOL_MESSAGES
+    self.c = 0
+
+  def receive(msg=('send', m, to), from_=checker):
+    super().send(m, to=to)
+
+  def receive(msg=m, from_=source):
+    if source == checker:
+      return
+    self.c += 1
+    msg = (f'received', self, self.c, m)
+    send(msg, to={ checker })
+
+  def receive(msg=('terminate',), from_=checker):
+    send(('done',), to={ checker })
+    exit()
+
+  def run():
+    send(('ready',), to={ checker })
+    await(False)
+
+class Checker(process):
+  def setup(nodes, name):
+    self.name = name
+    self.alice = nodes['alice'][0]
+    self.bob = nodes['bob'][0]
+    self.carol = nodes['carol'][0]
+    self.d_alice = nodes['alice'][1]
+    self.d_bob = nodes['bob'][1]
+    self.d_carol = nodes['carol'][1]
+    self.node_pids = {v[0] for v in nodes.values()}
+    self.num_nodes = len(self.node_pids)
+    self.ready_nodes = set()
+    self.done_nodes = set()
+
+  def receive(msg=('ready',), from_=source):
+    self.ready_nodes.add(source)
+
+  def receive(msg=('done',), from_=source):
+    self.done_nodes.add(source)
+
+  def output(s):
+    super().output(f'[{self.name}] {s}')
+
+  def write_results(test_name, results):
+    file_path = 'test_results/node_checker.txt'
+    with open(file_path, 'a') as f:
+      f.write(f'[{datetime.now().isoformat()}] {test_name}: {results}\n')
+
+  def test_gossip():
+    m = ('NOMINATE', self.alice, 1, frozenset({'x'}), frozenset(), self.d_alice)
+
+    # first send: alice -> bob only
+    send(('send', m, frozenset({self.bob})), to={self.alice})
+    await(some(received(('received', self.bob, _, m))))
+
+    # second send of the *same* message: bob repeated, carol new
+    send(('send', m, frozenset({self.bob, self.carol})), to={self.alice})
+    await(some(received(('received', self.carol, _, m))))
+
+    bob_hits = setof(c, received(('received', self.bob, c, m)))
+    carol_hits = setof(c, received(('received', self.carol, c, m)))
+    output(f'bob received {m} {len(bob_hits)} time(s) (expect 1)')
+    output(f'carol received {m} {len(carol_hits)} time(s) (expect 1)')
+
+    passed = len(bob_hits) == 1 and len(carol_hits) == 1
+    write_results('test_gossip', {
+      'bob_hits': len(bob_hits),
+      'carol_hits': len(carol_hits),
+      'passed': passed,
+    })
+
+  def run():
+    await(len(self.ready_nodes) == self.num_nodes)
+    output('all nodes ready, starting tests')
+
+    test_gossip()
+
+    send(('terminate',), to=self.node_pids)
+    await(len(self.done_nodes) == self.num_nodes)
+    output('all nodes done')
+    
+def main():
+
+  all_nodes = new(NodeX, num=len(QUORUM_CONFIG))
+  nodes = dict(zip(QUORUM_CONFIG.keys(), all_nodes))
+  nodes_w_D = dict()
+  debug_names = {str(pid): name for name, pid in nodes.items()}
+  output(f'created nodes: {nodes}')
+  checker = new(Checker, num=1)
+  checker_pid = next(iter(checker))
+  for node, config in QUORUM_CONFIG.items():
+    ## Build D as a tuple: (outer_threshold, ((inner_threshold, validators), ...))
+    inner_slices = tuple(
+      (s['threshold'], frozenset(nodes[name] for name in s['validators']))
+      for s in config['slices']
+    )
+    D = (config['threshold'], inner_slices)
+    nodes_w_D[node] = (nodes[node], D)
+    setup(nodes[node], [checker_pid, node, debug_names]) ## nodes start out knowing no peers at all; peer discovery happens purely from received protocol messages
+
+  setup(checker, [nodes_w_D, 'checker'])
+
+  start(nodes.values())
+  start(checker)
+
