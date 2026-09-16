@@ -1,6 +1,7 @@
 from node import Node
-from utils import hash_msg
+from utils import hash_msg, replace_node_ids
 from datetime import datetime
+from collections import Counter
 
 PROTOCOL_MESSAGES = {'NOMINATE'}
 
@@ -12,8 +13,8 @@ QUORUM_CONFIG = {
 }
 
 class NodeX(process, Node):
-  def setup(checker, name, debugNames):
-    super().setup(name, debugNames)
+  def setup(checker, name, debugNames, log_file):
+    super().setup(name, debugNames, log_file)
     self.protocol_messages = PROTOCOL_MESSAGES
     self.c = 0
 
@@ -24,7 +25,7 @@ class NodeX(process, Node):
     if source == checker:
       return
     self.c += 1
-    msg = (f'received', self, self.c, m)
+    msg = (f'received', self, source, self.c, m)
     send(msg, to={ checker })
 
   def receive(msg=('terminate',), from_=checker):
@@ -36,8 +37,9 @@ class NodeX(process, Node):
     await(False)
 
 class Checker(process):
-  def setup(nodes, name):
+  def setup(nodes, name, debug_names):
     self.name = name
+    self.debug_names = debug_names
     self.alice = nodes['alice'][0]
     self.bob = nodes['bob'][0]
     self.carol = nodes['carol'][0]
@@ -60,29 +62,28 @@ class Checker(process):
 
   def write_results(test_name, results):
     file_path = 'test_results/node_checker.txt'
+    line = replace_node_ids(results, self.debug_names)
     with open(file_path, 'a') as f:
-      f.write(f'[{datetime.now().isoformat()}] {test_name}: {results}\n')
+      f.write(f'[{datetime.now().isoformat()}] {test_name}: {line}\n')
 
   def test_gossip():
     m = ('NOMINATE', self.alice, 1, frozenset({'x'}), frozenset(), self.d_alice)
 
     # first send: alice -> bob only
     send(('send', m, frozenset({self.bob})), to={self.alice})
-    await(some(received(('received', self.bob, _, m))))
+    await timeout(2)
 
     # second send of the *same* message: bob repeated, carol new
     send(('send', m, frozenset({self.bob, self.carol})), to={self.alice})
-    await(some(received(('received', self.carol, _, m))))
+    await timeout(2)
 
-    bob_hits = setof(c, received(('received', self.bob, c, m)))
-    carol_hits = setof(c, received(('received', self.carol, c, m)))
-    output(f'bob received {m} {len(bob_hits)} time(s) (expect 1)')
-    output(f'carol received {m} {len(carol_hits)} time(s) (expect 1)')
+    messages = listof((sender, receiver, hash_msg( m )), received(('received', sender, receiver, c, m)))
+    m_freq = Counter(messages)
+  
+    passed = all(cnt <= 1 for cnt in m_freq.values())
 
-    passed = len(bob_hits) == 1 and len(carol_hits) == 1
     write_results('test_gossip', {
-      'bob_hits': len(bob_hits),
-      'carol_hits': len(carol_hits),
+      'messages': m_freq,
       'passed': passed,
     })
 
@@ -102,6 +103,7 @@ def main():
   nodes = dict(zip(QUORUM_CONFIG.keys(), all_nodes))
   nodes_w_D = dict()
   debug_names = {str(pid): name for name, pid in nodes.items()}
+  log_file = f'scp_log_{datetime.now().strftime("%Y%m%dT%H%M%S")}.txt' ## one file per run, shared by every node
   output(f'created nodes: {nodes}')
   checker = new(Checker, num=1)
   checker_pid = next(iter(checker))
@@ -113,9 +115,9 @@ def main():
     )
     D = (config['threshold'], inner_slices)
     nodes_w_D[node] = (nodes[node], D)
-    setup(nodes[node], [checker_pid, node, debug_names]) ## nodes start out knowing no peers at all; peer discovery happens purely from received protocol messages
+    setup(nodes[node], [checker_pid, node, debug_names, log_file]) ## nodes start out knowing no peers at all; peer discovery happens purely from received protocol messages
 
-  setup(checker, [nodes_w_D, 'checker'])
+  setup(checker, [nodes_w_D, 'checker', debug_names])
 
   start(nodes.values())
   start(checker)

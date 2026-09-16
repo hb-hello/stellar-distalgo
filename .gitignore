@@ -8,3 +8,4 @@ test.py
 .envrc
 stellar-core/
 test_results/
+logs/

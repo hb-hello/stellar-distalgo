@@ -13,6 +13,7 @@
 import time
 import hashlib
 from itertools import combinations
+from datetime import datetime
 from state import Ballot, State, INFINITY
 from node import Node
 
@@ -137,21 +138,22 @@ def max_priority_neighbor(D, n, i):
   return max((priority(n, v2), v2) for v2 in neighbors_set)[1]
 
 class SCPNode(process, Node):
-  def setup(D:tuple, name, debugNames):
+  def setup(D:tuple, name, debugNames, log_file):
     # D is node v’s quorum slice Q(v) or a collision-resistant hash of Q(v)
-    super().setup(name, debugNames)
+    super().setup(name, debugNames, log_file)
     self.protocol_messages = PROTOCOL_MESSAGES
     self.state_per_slot = dict()  ## To maintain the state per slot #? should this be a set instead of dict?
     ## map of peers (node ids and their quorum config) based on quorum slices
     for node in setof(n, (_, v) in D[1], n in v):
       self.peers[node] = None
     self.peers[self] = D
-    output(f'Node {self} initialized with quorum slices: {D} and peers: {self.peers}')
+    # output(f'Node {self} initialized with quorum slices: {D} and peers: {self.peers}')
 
   def receive(msg=('TRANSACTION', i, value)):
     # This is a message from a client adding a value for slot i.
     state = self.state_per_slot.setdefault(i, State(i, self.D)) ## retrieve or initialize the state for mentioned slot
     if state.v_n is None: state.v_n = max_priority_neighbor(self.D, state.n, state.slot)
+    log(f'{self} has {state.v_n} as max priority neighbour')
     if self == state.v_n:
       if update_nomination_state(state):
         send_nomination(state)
@@ -166,7 +168,7 @@ class SCPNode(process, Node):
     # sender’s latest NOMINATE message and the return value is the receiver’s.
     state.add_nomination(self, frozenset(state.X), frozenset(state.Y), self.D)
     msg = ('NOMINATE', self, state.slot, frozenset(state.X), frozenset(state.Y), self.D)
-    send(msg, to=self.peers.keys() - {self})
+    send(msg, to=self.peers.keys() - {self}, withLog=f'{self} nominating with X={state.X}, Y={state.Y} for slot {1 if state.slot else state.slot}')
     # highest-priority node can optimistically initiate balloting at the same time as nom-
     # ination, piggybacking its first ballot message PREPARE (described below) on its first
     # NOMINATE message.
@@ -189,6 +191,7 @@ class SCPNode(process, Node):
         # As soon as v has a candidate value, however, it must cease voting to nominate x
         # for any new values x
         if await(state.Z):
+          log(f'{self} now has candidate value Z={state.Z} for slot {state.slot}')
           break
         elif timeout(TIMEOUT):
           if state.X: ## do nothing if there is no nominate statement to vote for
@@ -282,7 +285,7 @@ class SCPNode(process, Node):
       # This is a message from node v about slot i. D specifies Q(v). The other fields
       # reflect v’s state. Values c.x and h.x are elided as c.x = h.x = b.x when c.n ≠ 0.
       state.add_message(('PREPARE', self, state.slot, state.b, state.p, state.p2, state.c.n, state.h.n, self.D))
-      send(('PREPARE', self, state.slot, state.b, state.p, state.p2, state.c.n, state.h.n, self.D), to=self.peers.keys() - {self})
+      send(('PREPARE', self, state.slot, state.b, state.p, state.p2, state.c.n, state.h.n, self.D), to=self.peers.keys() - {self}, withLog=f'{self} preparing ballot b={state.b} for slot {state.slot}')
 
     elif state.phi == 'CONFIRM':
       # CONFIRM v i b p.n c.n h.n D
@@ -436,12 +439,12 @@ class Client(process):
 
   def run():
     time.sleep(0.05)
-    send(('TRANSACTION', 1, 'A'), to={ nodes['alice'] })
-    send(('TRANSACTION', 1, 'B'), to={ nodes['bob'] })
-    send(('TRANSACTION', 1, 'C'), to={ nodes['carol'] })
-    send(('TRANSACTION', 1, 'D'), to={ nodes['dave'] })
-    send(('TRANSACTION', 1, 'E'), to={ nodes['eve'] })
-    send(('TRANSACTION', 1, 'F'), to={ nodes['frank'] })
+    send(('TRANSACTION', 1, 'A'), to=set(nodes.values()))
+    # send(('TRANSACTION', 1, 'B'), to={ nodes['bob'] })
+    # send(('TRANSACTION', 1, 'C'), to={ nodes['carol'] })
+    # send(('TRANSACTION', 1, 'D'), to={ nodes['dave'] })
+    # send(('TRANSACTION', 1, 'E'), to={ nodes['eve'] })
+    # send(('TRANSACTION', 1, 'F'), to={ nodes['frank'] })
 
 def main():
 
@@ -450,7 +453,7 @@ def main():
   clients = new(Client, [nodes], num=1)
 
   debug_names = {str(pid): name for name, pid in nodes.items()} ## lets output() replace raw node ids with names in log lines
-
+  log_file = f'scp_log_{datetime.now().strftime("%Y%m%dT%H%M%S")}.txt' 
   output(f'created nodes: {nodes}')
   for node, config in QUORUM_CONFIG.items():
     ## Build D as a tuple: (outer_threshold, ((inner_threshold, validators), ...))
@@ -459,7 +462,7 @@ def main():
       for s in config['slices']
     )
     D = (config['threshold'], inner_slices)
-    setup(nodes[node], [D, node, debug_names]) ## assuming that nodes start out only knowing the nodes in their quorum config and know no other nodes
+    setup(nodes[node], [D, node, debug_names, log_file]) ## assuming that nodes start out only knowing the nodes in their quorum config and know no other nodes
 
   start(nodes.values())
   start(clients)

@@ -1,7 +1,7 @@
-from utils import hash_msg
+from utils import hash_msg, replace_node_ids, log_to_file
 
 class Node(process):
-  def setup(name, debugNames):
+  def setup(name, debugNames, log_file):
     self.name = name
     self.debug_names = debugNames  ## maps str(node id) -> node name, so output() can de-anonymize ids in log lines
     self.peers = {}
@@ -10,26 +10,32 @@ class Node(process):
     output(f'Node {self} initialized')
 
   def output(s):
-    s = str(s)
-    for pid_str, node_name in self.debug_names.items():
-      s = s.replace(pid_str, node_name)
-    super().output(f'[{self.name}] {s}')
+    super().output(f'[{self.name}] {replace_node_ids(s, self.debug_names)}')
 
-  def send(msg, to, debugOnly=False):
+  def log(s):
+    log_to_file(self.log_file, s, self.debug_names)
+
+  def send(msg, to, debugOnly=False, withLog=None):
     if msg[0] in self.protocol_messages:
       to = to - self.gossip_known.setdefault(hash_msg(msg), set())
       self.gossip_known[hash_msg(msg)] |= to
     output(f'Sending message: {msg} to peers: {to}')
+    if to and withLog and not debugOnly:
+      log(withLog)
     if not debugOnly: super().send(msg, to=to)
 
   def receive(msg=m):
     output(f'received a message: {m}')
     if m[0] in self.protocol_messages:
-      gossip_known.setdefault(hash_msg(m), set()).add(m[1])
+      h = hash_msg(m)
+      already_seen = h in gossip_known
+      gossip_known.setdefault(h, set()).add(m[1])
       sender, D = m[1], m[-1]
       peers[sender] = D
       for node in setof(n, (_, v) in D[1], n in v):
         peers.setdefault(node, None)
+      if not already_seen:
+        send(m, to=peers.keys() - {self, sender})
 
   def run():
     await(False)
