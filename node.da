@@ -13,16 +13,17 @@ class Node(process):
     super().output(f'[{self.name}] {replace_node_ids(s, self.debug_names)}')
 
   def log(s):
-    log_to_file(self.log_file, s, self.debug_names)
+    if s: log_to_file(self.log_file, s, self.debug_names)
 
   def send(msg, to, debugOnly=False, withLog=None):
     if msg[0] in self.protocol_messages:
       to = to - self.gossip_known.setdefault(hash_msg(msg), set())
       self.gossip_known[hash_msg(msg)] |= to
     output(f'Sending message: {msg} to peers: {to}')
-    if to and withLog and not debugOnly:
-      log(withLog)
-    if not debugOnly: super().send(msg, to=to)
+    if not debugOnly: 
+      if to and withLog: log(withLog)
+      elif not to and withLog: log(f'deduped message not sending - {withLog}')
+      super().send(msg, to=to)
 
   def receive(msg=m):
     output(f'received a message: {m}')

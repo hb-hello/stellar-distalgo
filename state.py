@@ -134,7 +134,7 @@ class State:
     # Because X and Y grow monotonically over time, it is possible to determine which of mul-
     # tiple NOMINATE messages from the same node is the latest, independent of network delivery order
     ## return true if the nomination message is new and should be processed, false otherwise
-    existing_msg = next((m for m in self.N if m[1] == v), None)
+    existing_msg = next((m for m in self.N if m[0] == v), None)
     if existing_msg is None:
       self.N.add((v, frozenset(X), frozenset(Y), D))
       return True

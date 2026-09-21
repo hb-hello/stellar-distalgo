@@ -1,0 +1,110 @@
+from scp import SCPNode
+from utils import hash_msg, replace_node_ids
+from datetime import datetime
+from collections import Counter
+
+PROTOCOL_MESSAGES = {'NOMINATE'}
+
+## Small 3-node quorum, just enough for the gossip test (alice/bob/carol, 2-of-3 majority)
+QUORUM_CONFIG = {
+  'alice': {'threshold': 1, 'slices': [{'threshold': 2, 'validators': {'alice', 'bob', 'carol'}}]},
+  'bob':   {'threshold': 1, 'slices': [{'threshold': 2, 'validators': {'alice', 'bob', 'carol'}}]},
+  'carol': {'threshold': 1, 'slices': [{'threshold': 2, 'validators': {'alice', 'bob', 'carol'}}]},
+}
+
+class SCPNodeX(process, SCPNode):
+  def setup(D, checker, name, debugNames, log_file):
+    super().setup(D, name, debugNames, log_file)
+    self.protocol_messages = PROTOCOL_MESSAGES
+    self.c = 0
+
+  def receive(msg=('send', m, to), from_=checker):
+    super().send(m, to=to)
+
+  def receive(msg=m, from_=source):
+    if source == checker:
+      return
+    self.c += 1
+    msg = (f'received', self, source, self.c, m)
+    send(msg, to={ checker })
+
+  def receive(msg=('terminate',), from_=checker):
+    send(('done',), to={ checker })
+    exit()
+
+  def run():
+    send(('ready',), to={ checker })
+    await(False)
+
+class Checker(process):
+  def setup(nodes, D_nodes, name, debug_names):
+    self.name = name
+    self.debug_names = debug_names
+    self.num_nodes = len(self.nodes)
+    self.ready_nodes = set()
+    self.done_nodes = set()
+
+  def receive(msg=('ready',), from_=source):
+    self.ready_nodes.add(source)
+
+  def receive(msg=('done',), from_=source):
+    self.done_nodes.add(source)
+
+  def output(s):
+    super().output(f'[{self.name}] {s}')
+
+  def write_results(test_name, results):
+    file_path = 'test_results/scp_checker.txt'
+    line = replace_node_ids(results, self.debug_names)
+    with open(file_path, 'a') as f:
+      f.write(f'[{datetime.now().isoformat()}] {test_name}: {line}\n')
+
+  def test_nominate():
+    t1 = ('TRANSACTION', 1, 'A')
+
+    send(t1, to=set(nodes.values()))
+
+    await(lenof(m, received(('received', to, from, c, m)), m[0] == 'NOMINATE' and 'A' in m[4]) == len(nodes))
+
+  def receive(msg=('received', to, from, c, m), from_=source):
+    
+  
+  def run():
+    await(len(self.ready_nodes) == self.num_nodes)
+    output('all nodes ready, starting tests')
+
+    test_gossip()
+
+    send(('terminate',), to=self.node_pids)
+    await(len(self.done_nodes) == self.num_nodes)
+    output('all nodes done')
+    
+def main():
+
+  all_nodes = new(SCPNodeX, num=len(QUORUM_CONFIG))
+  nodes = dict(zip(QUORUM_CONFIG.keys(), all_nodes))
+  nodes_w_D = dict()
+  D_nodes = dict()
+
+  debug_names = {str(pid): name for name, pid in nodes.items()}
+  log_file = f'scp_log_{datetime.now().strftime("%Y%m%dT%H%M%S")}.txt' ## one file per run, shared by every node
+  output(f'created nodes: {nodes}')
+  checker = new(Checker, num=1)
+  checker_pid = next(iter(checker))
+  for node, config in QUORUM_CONFIG.items():
+    ## Build D as a tuple: (outer_threshold, ((inner_threshold, validators), ...))
+    inner_slices = tuple(
+      (s['threshold'], frozenset(nodes[name] for name in s['validators']))
+      for s in config['slices']
+    )
+    D = (config['threshold'], inner_slices)
+    nodes_w_D[node] = (nodes[node], D)
+    D_nodes[node] = D
+    setup(nodes[node], [D, checker_pid, node, debug_names, log_file])
+
+  setup(checker, [nodes, D_nodes, 'checker', debug_names])
+
+  start(nodes.values())
+  start(checker)
+
+

@@ -153,7 +153,6 @@ class SCPNode(process, Node):
     # This is a message from a client adding a value for slot i.
     state = self.state_per_slot.setdefault(i, State(i, self.D)) ## retrieve or initialize the state for mentioned slot
     if state.v_n is None: state.v_n = max_priority_neighbor(self.D, state.n, state.slot)
-    log(f'{self} has {state.v_n} as max priority neighbour')
     if self == state.v_n:
       if update_nomination_state(state):
         send_nomination(state)
@@ -166,7 +165,6 @@ class SCPNode(process, Node):
 
     # Only one remote procedure call (RPC) is needed for nomination - the argument is the
     # sender’s latest NOMINATE message and the return value is the receiver’s.
-    state.add_nomination(self, frozenset(state.X), frozenset(state.Y), self.D)
     msg = ('NOMINATE', self, state.slot, frozenset(state.X), frozenset(state.Y), self.D)
     send(msg, to=self.peers.keys() - {self}, withLog=f'{self} nominating with X={state.X}, Y={state.Y} for slot {1 if state.slot else state.slot}')
     # highest-priority node can optimistically initiate balloting at the same time as nom-
@@ -174,15 +172,31 @@ class SCPNode(process, Node):
     # NOMINATE message.
     send_message(state)
 
+    # v should use timeouts to decide on new nominate statements to vote for. After n timeouts, v should
+    # find a node v_n ∈ neighbors(v, n) maximizing priority(n, v_n) and vote to nominate every-
+    # thing v_n has voted to nominate
+    ## keep trying to nominate new values by incrementing the round number (n)
+    #? each slot will have its own while loop running
+    # As soon as v has a candidate value, however, it must cease voting to nominate x
+    # for any new values x
+    if await(state.Z):
+      log(f'{self} now has candidate value Z={state.Z} for slot {state.slot}')
+      break
+    elif timeout(TIMEOUT):
+      increment_n(state) ## increment nomination round number for this slot
+      if update_nomination_state(state): send_nomination(state) ## send nomination request message to peers for this slot based on updated n
+
+
+
   def increment_n(state:State, D=None):
     state.n += 1
     state.v_n = max_priority_neighbor(D, state.n, state.slot) if D is not None else None
 
-  def trigger_nomination_timeout(state:State):
-    ## only trigger nomination loop once for a particular slot 
-    if not state.nomination_loop_activated:
-      state.nomination_loop_activated = True
-      while(state.nomination_loop_activated):
+  # def trigger_nomination_timeout(state:State):
+  #   ## only trigger nomination loop once for a particular slot 
+  #   if not state.nomination_loop_activated:
+  #     state.nomination_loop_activated = True
+  #     while(state.nomination_loop_activated):
         # v should use timeouts to decide on new nominate statements to vote for. After n timeouts, v should
         # find a node v_n ∈ neighbors(v, n) maximizing priority(n, v_n) and vote to nominate every-
         # thing v_n has voted to nominate
@@ -190,13 +204,13 @@ class SCPNode(process, Node):
         #? each slot will have its own while loop running
         # As soon as v has a candidate value, however, it must cease voting to nominate x
         # for any new values x
-        if await(state.Z):
-          log(f'{self} now has candidate value Z={state.Z} for slot {state.slot}')
-          break
-        elif timeout(TIMEOUT):
-          if state.X: ## do nothing if there is no nominate statement to vote for
-            increment_n(state) ## increment nomination round number for this slot
-            if update_nomination_state(state): send_nomination(state) ## send nomination request message to peers for this slot based on updated n
+  #       if await(state.Z):
+  #         log(f'{self} now has candidate value Z={state.Z} for slot {state.slot}')
+  #         break
+  #       elif timeout(TIMEOUT):
+  #         if state.X: ## do nothing if there is no nominate statement to vote for
+  #           increment_n(state) ## increment nomination round number for this slot
+  #           if update_nomination_state(state): send_nomination(state) ## send nomination request message to peers for this slot based on updated n
 
   def update_nomination_state(state:State):
     # Each node v should initially find a node v0 ∈ neighbors(v, 0) that maximizes
@@ -211,9 +225,7 @@ class SCPNode(process, Node):
       #? in this case I don't need to write it like _state.v_n?
     state.votes |= setof(('nominate', self, x), x in state.X)
 
-    ## check if X was updated
     updated = False
-    if state.add_nomination(self, frozenset(state.X), frozenset(state.Y), self.D): updated = True
 
     ## move values from X to Y based on federated voting
     nominate_votes = setof((v, x), ('nominate', v, x) in state.votes)
@@ -223,7 +235,6 @@ class SCPNode(process, Node):
       if is_in_quorum(self, setof((v, peers.get(v)), v in setof(v1, (v1, _x1) in nominate_votes) | setof(v2, (v2, _x1) in accept_nominate_votes))) or is_blocking(D, setof(v, (v, _x1) in accept_nominate_votes)):
         state.Y.add(x1)
         state.votes.add(('accept_nominate', self, x1)) ## add own accept_nominate vote for x1
-        updated = True
 
     # A node v considers a value x to be a candidate when v has
     # confirmed the statement nominate x—i.e., v has ratified accept (nominate x).
@@ -231,8 +242,12 @@ class SCPNode(process, Node):
     for x2 in setof(x, (_, x) in accept_nominate_votes, x not in state.Z):
       if x2 in state.Y and is_in_quorum(self, setof((v, peers.get(v)), v in setof(v1, (v1, _x2) in accept_nominate_votes))):
         state.Z.add(x2)
-        updated = True
-    
+        updated = True ## reaching a candidate value should still trigger send_message even if X/Y are unchanged
+
+    ## X and Y are both final for this call now - this is the one true check for whether
+    ## our own nomination content actually changed (and the one place state.N's self-record should be updated)
+    if state.add_nomination(self, frozenset(state.X), frozenset(state.Y), self.D): updated = True
+
     return updated
 
   def receive(msg=('NOMINATE', sender, i, X, Y, D)):
