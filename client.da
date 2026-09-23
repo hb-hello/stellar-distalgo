@@ -1,0 +1,18 @@
+import random
+import string
+
+## Configurable workload generator for driving TRANSACTION traffic into a set of nodes
+## during testing. 
+def random_value():
+  return random.choice(string.ascii_uppercase)
+
+class Client(process):
+
+  def send_all_same(slot_range, nodes, value_gen=random_value):
+    for i in slot_range:
+      send(('TRANSACTION', i, value_gen()), to=set(nodes.values()))
+
+  def send_all_different(slot_range, nodes, value_gen=random_value):
+    for i in slot_range:
+      for node in nodes.values():
+        send(('TRANSACTION', i, value_gen()), to={ node })

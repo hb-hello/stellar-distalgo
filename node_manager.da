@@ -1,0 +1,61 @@
+QUORUM_CONFIG = {
+  'alice': {'threshold': 1, 'slices': [{'threshold': 2, 'validators': {'alice', 'bob', 'carol'}}]},
+  'bob':   {'threshold': 1, 'slices': [{'threshold': 2, 'validators': {'alice', 'bob', 'carol'}}]},
+  'carol': {'threshold': 1, 'slices': [{'threshold': 2, 'validators': {'alice', 'bob', 'carol'}}]},
+}
+
+## Two self-referencing top tiers (alice-dave, eve-heidi) that never reference each
+## other, so each computes its own leader independently - two simultaneous leaders.
+DISJOINT_LEADERS_CONFIG = {
+  'alice': {'threshold': 1, 'slices': [{'threshold': 3, 'validators': {'alice', 'bob', 'carol', 'dave'}}]},
+  'bob':   {'threshold': 1, 'slices': [{'threshold': 3, 'validators': {'alice', 'bob', 'carol', 'dave'}}]},
+  'carol': {'threshold': 1, 'slices': [{'threshold': 3, 'validators': {'alice', 'bob', 'carol', 'dave'}}]},
+  'dave':  {'threshold': 1, 'slices': [{'threshold': 3, 'validators': {'alice', 'bob', 'carol', 'dave'}}]},
+
+  'eve':   {'threshold': 1, 'slices': [{'threshold': 3, 'validators': {'eve', 'frank', 'grace', 'heidi'}}]},
+  'frank': {'threshold': 1, 'slices': [{'threshold': 3, 'validators': {'eve', 'frank', 'grace', 'heidi'}}]},
+  'grace': {'threshold': 1, 'slices': [{'threshold': 3, 'validators': {'eve', 'frank', 'grace', 'heidi'}}]},
+  'heidi': {'threshold': 1, 'slices': [{'threshold': 3, 'validators': {'eve', 'frank', 'grace', 'heidi'}}]},
+
+  'ivan':  {'threshold': 1, 'slices': [{'threshold': 2, 'validators': {'alice', 'bob', 'eve', 'frank'}}]},
+  'judy':  {'threshold': 1, 'slices': [{'threshold': 2, 'validators': {'carol', 'dave', 'grace', 'heidi'}}]},
+}
+
+## Owns the lifecycle of a test round's node processes 
+class NodeManager(process):
+  def setup():
+    self.nodes = {}
+    self.debug_names = {}
+    self.ready_nodes = set()
+    self.done_nodes = set()
+
+  def receive(msg=(tid, 'ready'), from_=source):
+    self.ready_nodes.add(source)
+
+  def receive(msg=(tid, 'done'), from_=source):
+    self.done_nodes.add(source)
+
+  ## Spawn a fresh batch of `node_cls` processes for one test round, tagged with
+  ## `test_id`. 
+  def spawn_nodes(quorum_config, node_cls, test_id, log_file):
+    self.ready_nodes = set()
+    self.done_nodes = set()
+    all_nodes = new(node_cls, num=len(quorum_config))
+    self.nodes = dict(zip(quorum_config.keys(), all_nodes))
+    self.debug_names = {str(pid): node_name for node_name, pid in nodes.items()}
+    for node_name, config in quorum_config.items():
+      ## Build D as a tuple: (outer_threshold, ((inner_threshold, validators), ...))
+      inner_slices = tuple(
+        (s['threshold'], frozenset(nodes[n] for n in s['validators']))
+        for s in config['slices']
+      )
+      D = (config['threshold'], inner_slices)
+      setup(nodes[node_name], [D, self, node_name, debug_names, log_file, test_id])
+    start(nodes.values())
+    await(len(self.ready_nodes) == len(quorum_config))
+    output(f'spawned nodes for test {test_id}: {nodes}')
+
+  def teardown_nodes():
+    send(('terminate',), to=set(nodes.values()))
+    await(len(self.done_nodes) == len(nodes))
+    self.nodes = {}

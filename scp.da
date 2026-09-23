@@ -151,12 +151,12 @@ class SCPNode(process, Node):
 
   def receive(msg=('TRANSACTION', i, value)):
     # This is a message from a client adding a value for slot i.
+    is_new_slot = i not in self.state_per_slot
     state = self.state_per_slot.setdefault(i, State(i, self.D)) ## retrieve or initialize the state for mentioned slot
     if state.v_n is None: state.v_n = max_priority_neighbor(self.D, state.n, state.slot)
-    if self == state.v_n:
-      if update_nomination_state(state):
-        send_nomination(state)
-        trigger_nomination_timeout(state) ## trigger nomination loop to start incrementing nomination rounds till a value is confirmed
+    if update_nomination_state(state):
+      send_nomination(state)
+    if is_new_slot: search_leader(state)
 
   def send_nomination(state:State):
     # NOMINATE v i X Y D
@@ -166,51 +166,41 @@ class SCPNode(process, Node):
     # Only one remote procedure call (RPC) is needed for nomination - the argument is the
     # sender’s latest NOMINATE message and the return value is the receiver’s.
     msg = ('NOMINATE', self, state.slot, frozenset(state.X), frozenset(state.Y), self.D)
-    send(msg, to=self.peers.keys() - {self}, withLog=f'{self} nominating with X={state.X}, Y={state.Y} for slot {1 if state.slot else state.slot}')
+    send(msg, to=self.peers.keys() - {self}, withLog=f'{self} nominating with X={state.X}, Y={state.Y} for slot {1 if state.slot is True else state.slot}, round {state.n}')
     # highest-priority node can optimistically initiate balloting at the same time as nom-
     # ination, piggybacking its first ballot message PREPARE (described below) on its first
     # NOMINATE message.
-    send_message(state)
+    # send_message(state)
 
+  def search_leader(state:State):
+    ## keep trying to nominate new values by incrementing the round number (n)
+    #? each slot will have its own while loop running
+    while True:
+      if await(state.X):
+        break
+      elif timeout(TIMEOUT):
+        increment_n(state, self.D) ## increment nomination round number for this slot
+        if update_nomination_state(state): send_nomination(state) ## send nomination request message to peers for this slot based on updated n
+    await_candidate(state)
+
+  def await_candidate(state:State):
     # v should use timeouts to decide on new nominate statements to vote for. After n timeouts, v should
     # find a node v_n ∈ neighbors(v, n) maximizing priority(n, v_n) and vote to nominate every-
     # thing v_n has voted to nominate
-    ## keep trying to nominate new values by incrementing the round number (n)
-    #? each slot will have its own while loop running
     # As soon as v has a candidate value, however, it must cease voting to nominate x
     # for any new values x
-    if await(state.Z):
-      log(f'{self} now has candidate value Z={state.Z} for slot {state.slot}')
-      break
-    elif timeout(TIMEOUT):
-      increment_n(state) ## increment nomination round number for this slot
-      if update_nomination_state(state): send_nomination(state) ## send nomination request message to peers for this slot based on updated n
+    while True:
+      if await(state.Z):
+        break
+      elif timeout(TIMEOUT):
+        increment_n(state, self.D) ## increment nomination round number for this slot
+        if update_nomination_state(state): send_nomination(state) ## send nomination request message to peers for this slot based on updated n
+    log(f'{self} now has candidate value Z={state.Z} for slot {state.slot}')
+    send_message(state)
 
-
-
-  def increment_n(state:State, D=None):
+  def increment_n(state:State, D):
     state.n += 1
-    state.v_n = max_priority_neighbor(D, state.n, state.slot) if D is not None else None
-
-  # def trigger_nomination_timeout(state:State):
-  #   ## only trigger nomination loop once for a particular slot 
-  #   if not state.nomination_loop_activated:
-  #     state.nomination_loop_activated = True
-  #     while(state.nomination_loop_activated):
-        # v should use timeouts to decide on new nominate statements to vote for. After n timeouts, v should
-        # find a node v_n ∈ neighbors(v, n) maximizing priority(n, v_n) and vote to nominate every-
-        # thing v_n has voted to nominate
-        ## keep trying to nominate new values by incrementing the round number (n)
-        #? each slot will have its own while loop running
-        # As soon as v has a candidate value, however, it must cease voting to nominate x
-        # for any new values x
-  #       if await(state.Z):
-  #         log(f'{self} now has candidate value Z={state.Z} for slot {state.slot}')
-  #         break
-  #       elif timeout(TIMEOUT):
-  #         if state.X: ## do nothing if there is no nominate statement to vote for
-  #           increment_n(state) ## increment nomination round number for this slot
-  #           if update_nomination_state(state): send_nomination(state) ## send nomination request message to peers for this slot based on updated n
+    state.v_n = max_priority_neighbor(D, state.n, state.slot)
 
   def update_nomination_state(state:State):
     # Each node v should initially find a node v0 ∈ neighbors(v, 0) that maximizes
@@ -224,8 +214,6 @@ class SCPNode(process, Node):
       #? distalgo question for above: I want to filter out triples in state.votes with the middle value equal to state.v_n but 
       #? in this case I don't need to write it like _state.v_n?
     state.votes |= setof(('nominate', self, x), x in state.X)
-
-    updated = False
 
     ## move values from X to Y based on federated voting
     nominate_votes = setof((v, x), ('nominate', v, x) in state.votes)
@@ -242,15 +230,14 @@ class SCPNode(process, Node):
     for x2 in setof(x, (_, x) in accept_nominate_votes, x not in state.Z):
       if x2 in state.Y and is_in_quorum(self, setof((v, peers.get(v)), v in setof(v1, (v1, _x2) in accept_nominate_votes))):
         state.Z.add(x2)
-        updated = True ## reaching a candidate value should still trigger send_message even if X/Y are unchanged
+        # updated = True ## reaching a candidate value should still trigger send_message even if X/Y are unchanged
 
     ## X and Y are both final for this call now - this is the one true check for whether
     ## our own nomination content actually changed (and the one place state.N's self-record should be updated)
-    if state.add_nomination(self, frozenset(state.X), frozenset(state.Y), self.D): updated = True
-
-    return updated
+    return state.add_nomination(self, frozenset(state.X), frozenset(state.Y), self.D)
 
   def receive(msg=('NOMINATE', sender, i, X, Y, D)):
+    is_new_slot = i not in self.state_per_slot
     state = self.state_per_slot.setdefault(i, State(i, self.D)) ## retrieve the state for mentioned slot
     if state.v_n is None: state.v_n = max_priority_neighbor(self.D, state.n, state.slot)
 
@@ -272,8 +259,7 @@ class SCPNode(process, Node):
     #c nodes broadcast their state whenever there is an update in state
     if update_nomination_state(state):
       send_nomination(state)
-      trigger_nomination_timeout(state)
-
+    if is_new_slot: search_leader(state)
 
   # Fig. 17. Messages in SCP’s ballot protocol
 
@@ -299,24 +285,24 @@ class SCPNode(process, Node):
       # PREPARE v i b p p2 c.n h.n D
       # This is a message from node v about slot i. D specifies Q(v). The other fields
       # reflect v’s state. Values c.x and h.x are elided as c.x = h.x = b.x when c.n ≠ 0.
-      state.add_message(('PREPARE', self, state.slot, state.b, state.p, state.p2, state.c.n, state.h.n, self.D))
-      send(('PREPARE', self, state.slot, state.b, state.p, state.p2, state.c.n, state.h.n, self.D), to=self.peers.keys() - {self}, withLog=f'{self} preparing ballot b={state.b} for slot {state.slot}')
+      if state.add_message(('PREPARE', self, state.slot, state.b, state.p, state.p2, state.c.n, state.h.n, self.D)):
+        send(('PREPARE', self, state.slot, state.b, state.p, state.p2, state.c.n, state.h.n, self.D), to=self.peers.keys() - {self}, withLog=f'{self} preparing ballot b={state.b} for slot {state.slot}')
 
     elif state.phi == 'CONFIRM':
       # CONFIRM v i b p.n c.n h.n D
       # Sent by v to try to externalize b.x for slot i after accepting a commit. Implies
       # p.x = c.x = h.x = b.x in v’s state. For convenience, we also say p2 = 0 (p2 is
       # irrelevant after accepting commit). D specifies Q(v) as above.
-      state.add_message(('CONFIRM', self, state.slot, Ballot(n=INFINITY, x=state.b.x), state.p.n, state.c.n, state.h.n, self.D))
-      send(('CONFIRM', self, state.slot, Ballot(n=INFINITY, x=state.b.x), state.p.n, state.c.n, state.h.n, self.D), to=self.peers.keys() - {self})
+      if state.add_message(('CONFIRM', self, state.slot, Ballot(n=INFINITY, x=state.b.x), state.p.n, state.c.n, state.h.n, self.D)):
+        send(('CONFIRM', self, state.slot, Ballot(n=INFINITY, x=state.b.x), state.p.n, state.c.n, state.h.n, self.D), to=self.peers.keys() - {self})
 
     elif state.phi == 'EXTERNALIZE':
       # EXTERNALIZE v i x c.n h.n D
       # After v confirms commit ⟨c.n,x⟩ for slot i and externalizes value x, this
       # message helps other nodes externalize x. Implies c = ⟨c.n, x⟩ and h = ⟨h.n, x⟩.
       # For convenience, we also say b = p = h = ⟨infinity, x⟩, and p2 = 0.
-      state.add_message(('EXTERNALIZE', self, state.slot, state.b.x, state.c.n, state.h.n, self.D))
-      send(('EXTERNALIZE', self, state.slot, state.b.x, state.c.n, state.h.n, self.D), to=self.peers.keys() - {self})
+      if state.add_message(('EXTERNALIZE', self, state.slot, state.b.x, state.c.n, state.h.n, self.D)):
+        send(('EXTERNALIZE', self, state.slot, state.b.x, state.c.n, state.h.n, self.D), to=self.peers.keys() - {self})
 
   def receive(msg=('PREPARE', v, i, b, p, p2, c_n, h_n, D)):
     state = self.state_per_slot.setdefault(i) ## retrieve the state for mentioned slot
@@ -385,13 +371,15 @@ class SCPNode(process, Node):
       # is true: { abort b_old ∣ b_old ⋦ b }
 
       ## highest b for which we have either a quorum of abort votes or a v-blocking set of abort votes for all b_old ⋦ b
-      highest_aborted_ballot = max(setof(b, (_, _, b) in state.votes),
-                                          is_quorum_slice(self, D, setof(v, ('abort', v, _b) in state.votes)
-                                                      | setof(v, ('accept_abort', v, _b) in state.votes)))
+      abort_ballots = setof(b, (_, _, b) in state.votes,
+                            is_quorum_slice(self, D, setof(v, ('abort', v, _b) in state.votes)
+                                        | setof(v, ('accept_abort', v, _b) in state.votes)))
+      highest_aborted_ballot = max(abort_ballots) if abort_ballots else None
       if highest_aborted_ballot is None: return #? continue federated voting as no ballot can be accepted prepared
       ## find the smallest ballot higher than above ballot - this can be accepted as prepared
       state.p2 = state.p
-      state.p = min(setof(b, (_, _, b) in state.votes, b.gt_nc(highest_aborted_ballot)))
+      prepared_candidates = setof(b, (_, _, b) in state.votes, b.gt_nc(highest_aborted_ballot))
+      state.p = min(prepared_candidates) if prepared_candidates else state.p
       if state.p.gt_nc(state.h) or state.p2.gt_nc(state.h):
         state.c = Ballot()
         output(f'for slot {i}, set c to 0 due to p or p2 being greater than and not compatible with h')

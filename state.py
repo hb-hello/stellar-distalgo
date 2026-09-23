@@ -106,7 +106,6 @@ class State:
     self.Z = set()  # The set of values v considers candidate values
     self.N = set()  # The set of the latest nomination message received from each node ## map indexed on node id
     self.v_n = None ## the neighbor with the max priority - recalculated every time nomination round changes
-    self.nomination_loop_activated = False  ## flag to indicate whether the nomination loop is active for this slot
     # All four fields are initialized to the empty set.
 
 
@@ -134,6 +133,8 @@ class State:
     # Because X and Y grow monotonically over time, it is possible to determine which of mul-
     # tiple NOMINATE messages from the same node is the latest, independent of network delivery order
     ## return true if the nomination message is new and should be processed, false otherwise
+    if not X and not Y:
+      return False
     existing_msg = next((m for m in self.N if m[0] == v), None)
     if existing_msg is None:
       self.N.add((v, frozenset(X), frozenset(Y), D))
@@ -155,6 +156,8 @@ class State:
     ## return true if the message is new and should be processed, false otherwise
     sender = msg[1]
     phi, b, p, p2, h = extract_fields(msg)
+    if b.n == 0:
+      return False
     existing_msg = next((m for m in self.M if m[1] == sender), None)
 
     if existing_msg is None:

@@ -1,4 +1,6 @@
-from utils import hash_msg, replace_node_ids, log_to_file
+from utils import hash_msg, replace_node_ids, log_to_file, archive_logs
+
+archive_logs() ## runs once, when this module is first imported, before any node starts writing this run's log file
 
 class Node(process):
   def setup(name, debugNames, log_file):

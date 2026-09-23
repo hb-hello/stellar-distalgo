@@ -1,4 +1,6 @@
 import os
+import glob
+import shutil
 from datetime import datetime
 
 def hash_msg(msg: tuple):
@@ -18,3 +20,13 @@ def log_to_file(filename: str, s: str, debug_names: dict):
     os.makedirs('logs', exist_ok=True)
     with open(os.path.join('logs', filename), 'a') as f:
         f.write(f'[{datetime.now().isoformat()}] {line}\n')
+
+
+def archive_logs(logs_dir: str = 'logs'):
+    archive_dir = os.path.join(logs_dir, 'archives')
+    if not os.path.isdir(logs_dir):
+        return
+    os.makedirs(archive_dir, exist_ok=True)
+    for path in glob.glob(os.path.join(logs_dir, '*.txt')):
+        if os.path.isfile(path):
+            shutil.move(path, os.path.join(archive_dir, os.path.basename(path)))
