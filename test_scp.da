@@ -66,6 +66,17 @@ class Checker(process, Client, NodeManager):
   def validate_nomination(test_id, i):
     return each(n in self.nodes.values(), has=some(received((_test_id, 'candidate', _i, x), from_=n)))
 
+  ## Invariant: if any intact node considers x a candidate for slot i, eventually every
+  ## intact node considers x a candidate too - candidate confirmation has to propagate
+  ## to the whole network, not just whichever quorum ratified it first. Guarded by
+  ## validate_nomination so this isn't vacuously true before any candidates exist.
+  def validate_candidate_agreement(test_id, i):
+    if not self.validate_nomination(test_id, i): return False
+    confirmed = setof(x, n in self.nodes.values(), received((_test_id, 'candidate', _i, xs), from_=n), x in xs)
+    return each(x in confirmed, has=
+      each(n in self.nodes.values(), has=
+        some(received((_test_id, 'candidate', _i, xs2), from_=n), x in xs2)))
+
   ## Each case is (senders, validators, quorum_configs, slot_range); any of the
   ## first three may be a single value or a tuple/list of values, and every
   ## combination across them runs in its own isolated round of freshly spawned
@@ -86,6 +97,7 @@ class Checker(process, Client, NodeManager):
   def run():
     run_test([
       (self.send_all_different, self.validate_nomination, (DISJOINT_LEADERS_CONFIG), range(1, 21)),
+      (self.send_all_different, self.validate_candidate_agreement, (DISJOINT_LEADERS_CONFIG), range(1, 21)),
     ])
     output('all tests done')
 

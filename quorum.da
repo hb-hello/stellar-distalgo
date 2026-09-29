@@ -1,0 +1,75 @@
+# type: ignore
+## above comment for pylance to stop linting this as Python code
+
+QUORUM_CONFIG = {
+    # k-of-k2-of-n structurehow
+    # Top-tier nodes: each trusts any 3 members of the top tier (including itself)
+    'alice': {'threshold': 1, 'slices': [{'threshold': 3, 'validators': {'alice', 'bob', 'carol', 'dave'}}]},
+    'bob':   {'threshold': 1, 'slices': [{'threshold': 3, 'validators': {'alice', 'bob', 'carol', 'dave'}}]},
+    'carol': {'threshold': 1, 'slices': [{'threshold': 3, 'validators': {'alice', 'bob', 'carol', 'dave'}}]},
+    'dave':  {'threshold': 1, 'slices': [{'threshold': 3, 'validators': {'alice', 'bob', 'carol', 'dave'}}]},
+
+    # Second-tier nodes: each trusts any 2 members of the top tier
+    'eve':   {'threshold': 1, 'slices': [{'threshold': 2, 'validators': {'alice', 'bob', 'carol', 'dave'}}]},
+    'frank': {'threshold': 1, 'slices': [{'threshold': 2, 'validators': {'alice', 'bob', 'carol', 'dave'}}]},
+    'grace': {'threshold': 1, 'slices': [{'threshold': 2, 'validators': {'alice', 'bob', 'carol', 'dave'}}]},
+    'heidi': {'threshold': 1, 'slices': [{'threshold': 2, 'validators': {'alice', 'bob', 'carol', 'dave'}}]},
+
+    # Third-tier nodes: each trusts any 2 members of the second tier
+    'ivan':  {'threshold': 1, 'slices': [{'threshold': 2, 'validators': {'eve', 'frank', 'grace', 'heidi'}}]},
+    'judy':  {'threshold': 1, 'slices': [{'threshold': 2, 'validators': {'eve', 'frank', 'grace', 'heidi'}}]},
+}
+
+## Encapsulates the FBAS quorum-slice logic (quorum slice / quorum / blocking-set checks)
+## for a single node, so an alternate quorum/D implementation can be swapped in later
+## without touching the protocol code that consults it.
+class QuorumChecker:
+  ## v is the node id of the node whose quorum we're testing i.e. self
+  ## D is the quorum config of node v
+  def __init__(self, v, D):
+    self.v = v
+    self.D = D
+
+  # When a node hears a sufficient
+  # set of nodes assert a statement, it assumes no functioning node will ever contradict
+  # that statement. We call such a sufficient set a quorum slice, or, more concisely, just a
+  # slice. To permit progress in the face of node failures, a node may have multiple slices,
+  # any one of which is sufficient to convince it of a statement
+  ## check if the nodes in selected_validators satisfy a quorum slice for self.v
+  def is_quorum_slice(self, selected_validators):
+    return self._is_quorum_slice(self.v, self.D, selected_validators)
+
+  # Definition (quorum). A set of nodes U ⊆ V in FBAS ⟨V, Q⟩ is a quorum iff U ≠ <empty set> and
+  # U contains a slice for each member—i.e., ∀v ∈ U , ∃q ∈ Q(v) such that q ⊆ U.
+  ## check if self.v is part of a quorum of nodes in U
+  ## U is the set of pairs with node ids and their quorum configs
+  def is_in_quorum(self, U):
+    ##
+    #c remove all nodes from U that do not have their quorum slice satisfied in U, g
+    #c and converge on a self-sufficient quorum set (if v gets removed fail early)
+    ##
+    nodes = {node for (node, _) in U}
+    while(self.v in nodes):
+      to_remove = setof(n, (n, D) in U, n in nodes and not self._is_quorum_slice(n, D, nodes))
+      if not to_remove: break
+      else:
+        for n2 in to_remove: nodes.discard(n2)
+    return self.v in nodes
+
+  def is_blocking(self, selected_validators:set):
+    t, s = self.D
+    # Definition (v-blocking). Let v ∈ V be a node in FBAS ⟨V, Q⟩. A set B ⊆ V is v-blocking
+    # iff it overlaps every one of v’s slices—i.e., ∀q ∈ Q(v), q ∩ B ≠ ∅.
+    ## A slice (threshold, validators) is blocked by set of nodes B when len(validators & B) > len(validators) - threshold
+    ## i.e. B has captured enough validators that the remaining non-B validators cannot meet threshold alone.
+    return lenof(s, (threshold, validators) in s, len(validators & selected_validators) > len(validators) - threshold) > len(s) - t
+
+  ## v is the node id of the node whose quorum we're testing - not necessarily self.v,
+  ## since is_in_quorum needs to check this for every node it encounters while converging
+  ## on U, each with its own (possibly different) D.
+  ## D is that node's quorum config
+  ## we want to check if the nodes in selected_validators satisfy a quorum slice for node v
+  def _is_quorum_slice(self, v, D, selected_validators):
+    if v not in selected_validators or D is None: return False
+    t, s = D
+    return lenof((threshold, validators), (threshold, validators) in s, len(validators & selected_validators) >= threshold) >= t

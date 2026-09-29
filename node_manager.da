@@ -4,18 +4,32 @@ QUORUM_CONFIG = {
   'carol': {'threshold': 1, 'slices': [{'threshold': 2, 'validators': {'alice', 'bob', 'carol'}}]},
 }
 
-## Two self-referencing top tiers (alice-dave, eve-heidi) that never reference each
-## other, so each computes its own leader independently - two simultaneous leaders.
+## Both tiers reference the SAME full 8-node top-tier validator set (alice..heidi), just
+## at different thresholds: alice/bob/carol/dave need 5-of-8, eve/frank/grace/heidi need
+## 6-of-8. Since every node's D lists all 8 names, everyone is directly peered with
+## everyone else (no gossip relay needed to cross tiers) - unlike an earlier version of
+## this config that made a separate node's independent vote mandatory via a nested AND
+## slice, which meant ratification (Y->Z) could never succeed because that node's own
+## nomination view rarely converged on the same value (nodes never got past X/Y - no
+## slot ever produced a candidate). Here, quorum intersection is via plain pigeonhole:
+## every valid quorum needs >=6-of-8 (5-of-8 alone is never enough once any 6-threshold
+## member is present, and there aren't enough non-top nodes to substitute), so any two
+## quorums share >=4 members - and because those members vote directly (not through an
+## uninvolved third party), the shared members' own accept_nominate votes are exactly
+## what's needed to ratify. The two thresholds (5 vs 6) still give alice/bob/carol/dave
+## and eve/frank/grace/heidi different weight() values off the same candidate pool, so
+## their locally-computed max-priority neighbor can still diverge round to round.
+_TOP8 = {'alice', 'bob', 'carol', 'dave', 'eve', 'frank', 'grace', 'heidi'}
 DISJOINT_LEADERS_CONFIG = {
-  'alice': {'threshold': 1, 'slices': [{'threshold': 3, 'validators': {'alice', 'bob', 'carol', 'dave'}}]},
-  'bob':   {'threshold': 1, 'slices': [{'threshold': 3, 'validators': {'alice', 'bob', 'carol', 'dave'}}]},
-  'carol': {'threshold': 1, 'slices': [{'threshold': 3, 'validators': {'alice', 'bob', 'carol', 'dave'}}]},
-  'dave':  {'threshold': 1, 'slices': [{'threshold': 3, 'validators': {'alice', 'bob', 'carol', 'dave'}}]},
+  'alice': {'threshold': 1, 'slices': [{'threshold': 5, 'validators': _TOP8}]},
+  'bob':   {'threshold': 1, 'slices': [{'threshold': 5, 'validators': _TOP8}]},
+  'carol': {'threshold': 1, 'slices': [{'threshold': 5, 'validators': _TOP8}]},
+  'dave':  {'threshold': 1, 'slices': [{'threshold': 5, 'validators': _TOP8}]},
 
-  'eve':   {'threshold': 1, 'slices': [{'threshold': 3, 'validators': {'eve', 'frank', 'grace', 'heidi'}}]},
-  'frank': {'threshold': 1, 'slices': [{'threshold': 3, 'validators': {'eve', 'frank', 'grace', 'heidi'}}]},
-  'grace': {'threshold': 1, 'slices': [{'threshold': 3, 'validators': {'eve', 'frank', 'grace', 'heidi'}}]},
-  'heidi': {'threshold': 1, 'slices': [{'threshold': 3, 'validators': {'eve', 'frank', 'grace', 'heidi'}}]},
+  'eve':   {'threshold': 1, 'slices': [{'threshold': 6, 'validators': _TOP8}]},
+  'frank': {'threshold': 1, 'slices': [{'threshold': 6, 'validators': _TOP8}]},
+  'grace': {'threshold': 1, 'slices': [{'threshold': 6, 'validators': _TOP8}]},
+  'heidi': {'threshold': 1, 'slices': [{'threshold': 6, 'validators': _TOP8}]},
 
   'ivan':  {'threshold': 1, 'slices': [{'threshold': 2, 'validators': {'alice', 'bob', 'eve', 'frank'}}]},
   'judy':  {'threshold': 1, 'slices': [{'threshold': 2, 'validators': {'carol', 'dave', 'grace', 'heidi'}}]},

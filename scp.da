@@ -16,25 +16,7 @@ from itertools import combinations
 from datetime import datetime
 from state import Ballot, State, INFINITY
 from node import Node
-
-QUORUM_CONFIG = {
-    # k-of-k2-of-n structurehow
-    # Top-tier nodes: each trusts any 3 members of the top tier (including itself)
-    'alice': {'threshold': 1, 'slices': [{'threshold': 3, 'validators': {'alice', 'bob', 'carol', 'dave'}}]},
-    'bob':   {'threshold': 1, 'slices': [{'threshold': 3, 'validators': {'alice', 'bob', 'carol', 'dave'}}]},
-    'carol': {'threshold': 1, 'slices': [{'threshold': 3, 'validators': {'alice', 'bob', 'carol', 'dave'}}]},
-    'dave':  {'threshold': 1, 'slices': [{'threshold': 3, 'validators': {'alice', 'bob', 'carol', 'dave'}}]},
-
-    # Second-tier nodes: each trusts any 2 members of the top tier
-    'eve':   {'threshold': 1, 'slices': [{'threshold': 2, 'validators': {'alice', 'bob', 'carol', 'dave'}}]},
-    'frank': {'threshold': 1, 'slices': [{'threshold': 2, 'validators': {'alice', 'bob', 'carol', 'dave'}}]},
-    'grace': {'threshold': 1, 'slices': [{'threshold': 2, 'validators': {'alice', 'bob', 'carol', 'dave'}}]},
-    'heidi': {'threshold': 1, 'slices': [{'threshold': 2, 'validators': {'alice', 'bob', 'carol', 'dave'}}]},
-
-    # Third-tier nodes: each trusts any 2 members of the second tier
-    'ivan':  {'threshold': 1, 'slices': [{'threshold': 2, 'validators': {'eve', 'frank', 'grace', 'heidi'}}]},
-    'judy':  {'threshold': 1, 'slices': [{'threshold': 2, 'validators': {'eve', 'frank', 'grace', 'heidi'}}]},
-}
+from quorum import QuorumChecker, QUORUM_CONFIG
 
 TIMEOUT = 1
 
@@ -45,44 +27,6 @@ PROTOCOL_MESSAGES = {'NOMINATE', 'PREPARE', 'CONFIRM', 'EXTERNALIZE'}
 ## to be defined based on application later on
 def combine(values:set):
   return frozenset(values)
-
-# When a node hears a sufficient
-# set of nodes assert a statement, it assumes no functioning node will ever contradict
-# that statement. We call such a sufficient set a quorum slice, or, more concisely, just a
-# slice. To permit progress in the face of node failures, a node may have multiple slices,
-# any one of which is sufficient to convince it of a statement
-## v is the node id of the node whose quorum we're testing i.e. self
-## D is the quorum config of the node v
-## we want to check if the nodes in selected_validators satisfy a quorum slice for node v
-def is_quorum_slice(v, D, selected_validators):
-  if v not in selected_validators or D is None: return False
-  t, s = D
-  return lenof((threshold, validators), (threshold, validators) in s, len(validators & selected_validators) >= threshold) >= t
-
-# Definition (quorum). A set of nodes U ⊆ V in FBAS ⟨V, Q⟩ is a quorum iff U ≠ <empty set> and
-# U contains a slice for each member—i.e., ∀v ∈ U , ∃q ∈ Q(v) such that q ⊆ U.
-## check if node v is part of a quorum of nodes in U
-## U is the set of pairs with node ids and their quorum configs
-def is_in_quorum(v, U):
-  ##
-  #c remove all nodes from U that do not have their quorum slice satisfied in U, g
-  #c and converge on a self-sufficient quorum set (if v gets removed fail early)
-  ##
-  nodes = {node for (node, _) in U}
-  while(v in nodes):
-    to_remove = setof(n, (n, D) in U, not is_quorum_slice(n, D, setof(n1, (n1, _) in U)))
-    if not to_remove: break
-    else: 
-      for n2 in to_remove: nodes.discard(n2)
-  return v in nodes
-
-def is_blocking(D, selected_validators:set):
-  t, s = D
-  # Definition (v-blocking). Let v ∈ V be a node in FBAS ⟨V, Q⟩. A set B ⊆ V is v-blocking
-  # iff it overlaps every one of v’s slices—i.e., ∀q ∈ Q(v), q ∩ B ≠ ∅.
-  ## A slice (threshold, validators) is blocked by set of nodes B when len(validators & B) > len(validators) - threshold
-  ## i.e. B has captured enough validators that the remaining non-B validators cannot meet threshold alone.
-  return lenof(s, (threshold, validators) in s, len(validators & selected_validators) > len(validators) - threshold) > len(s) - t
 
 # Let gi(m) = H(i, xi−1, m) be a slot-specific hash
 # function for slot i, where xi−1 is the value chosen for the slot preceding i (or the sorted
@@ -143,6 +87,7 @@ class SCPNode(process, Node):
     super().setup(name, debugNames, log_file)
     self.protocol_messages = PROTOCOL_MESSAGES
     self.state_per_slot = dict()  ## To maintain the state per slot #? should this be a set instead of dict?
+    self.quorum_checker = QuorumChecker(self, D)
     ## map of peers (node ids and their quorum config) based on quorum slices
     for node in setof(n, (_, v) in D[1], n in v):
       self.peers[node] = None
@@ -220,7 +165,7 @@ class SCPNode(process, Node):
     accept_nominate_votes = setof((v, x), ('accept_nominate', v, x) in state.votes)
 
     for x1 in setof(x, (_, x) in nominate_votes, x not in state.Y):
-      if is_in_quorum(self, setof((v, peers.get(v)), v in setof(v1, (v1, _x1) in nominate_votes) | setof(v2, (v2, _x1) in accept_nominate_votes))) or is_blocking(D, setof(v, (v, _x1) in accept_nominate_votes)):
+      if quorum_checker.is_in_quorum(setof((v, peers.get(v)), v in setof(v1, (v1, _x1) in nominate_votes) | setof(v2, (v2, _x1) in accept_nominate_votes))) or quorum_checker.is_blocking(setof(v, (v, _x1) in accept_nominate_votes)):
         state.Y.add(x1)
         state.votes.add(('accept_nominate', self, x1)) ## add own accept_nominate vote for x1
 
@@ -228,7 +173,7 @@ class SCPNode(process, Node):
     # confirmed the statement nominate x—i.e., v has ratified accept (nominate x).
     ## move values from Y to Z based on candidate criteria
     for x2 in setof(x, (_, x) in accept_nominate_votes, x not in state.Z):
-      if x2 in state.Y and is_in_quorum(self, setof((v, peers.get(v)), v in setof(v1, (v1, _x2) in accept_nominate_votes))):
+      if x2 in state.Y and quorum_checker.is_in_quorum(setof((v, peers.get(v)), v in setof(v1, (v1, _x2) in accept_nominate_votes))):
         state.Z.add(x2)
         # updated = True ## reaching a candidate value should still trigger send_message even if X/Y are unchanged
 
@@ -249,9 +194,6 @@ class SCPNode(process, Node):
     # — { nominate x ∣ x ∈ X } (votes to nominate each value in X)
     for x in X:
       state.votes.add(('nominate', sender, x))
-      # if can_nominate:
-      #   state.X.add(x) ## add value to X values for this slot
-      #   state.votes.add(('nominate', self, x)) ## add own nominate vote for this value
     # — { accept (nominate x) ∣ x ∈ Y } (votes to confirm nominations in Y)
     for y in Y:
       state.votes.add(('accept_nominate', sender, y))
@@ -372,7 +314,7 @@ class SCPNode(process, Node):
 
       ## highest b for which we have either a quorum of abort votes or a v-blocking set of abort votes for all b_old ⋦ b
       abort_ballots = setof(b, (_, _, b) in state.votes,
-                            is_quorum_slice(self, D, setof(v, ('abort', v, _b) in state.votes)
+                            quorum_checker.is_quorum_slice(setof(v, ('abort', v, _b) in state.votes)
                                         | setof(v, ('accept_abort', v, _b) in state.votes)))
       highest_aborted_ballot = max(abort_ballots) if abort_ballots else None
       if highest_aborted_ballot is None: return #? continue federated voting as no ballot can be accepted prepared
