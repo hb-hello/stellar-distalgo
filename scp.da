@@ -12,11 +12,11 @@
 
 import time
 import hashlib
-from itertools import combinations
 from datetime import datetime
 from state import Ballot, State, INFINITY
 from node import Node
-from quorum import QuorumChecker, QUORUM_CONFIG
+from quorum_simple import QUORUM_CONFIG
+import quorum
 
 TIMEOUT = 1
 
@@ -38,45 +38,23 @@ def gi(i, xi_minus_1, m):
   input_str = f"{i}:{xi_minus_1}:{m}"
   return hashlib.sha256(input_str.encode()).hexdigest()
 
-def nCr(n, r):
-  if r > n or r < 0: return 0
-  if r == 0 or r == n: return 1
-  r = min(r, n - r)
-  result = 1
-  for i in range(r):
-    result *= (n - i) // (i + 1)
-  return result
-
-def weight(D, v):
-  threshold, slices = D
-  # weight(v, v2) = |{q | q ∈ Q(v) & v2 ∈ q}| / |Q(v)|
-  # The function weight (v, v2) returns the fraction of slices in Q(v) containing v2
-  total = with_v = 0
-  for combo in combinations(slices, threshold):
-    p = 1
-    for s in combo: p *= nCr(len(s[1]), s[0])
-    total += p
-    if any(v in s[1] for s in combo):
-      q = 1
-      for s in combo: q *= nCr(len(s[1])-1, s[0]-1) if v in s[1] else nCr(len(s[1]), s[0])
-      with_v += q
-  return with_v / total if total > 0 else 0
-
-def neighbors(D, n, i):
-  threshold, slices = D
+def neighbors(qc, peers, n, i):
   # neighbors(v, n) = { v2 | gi(N, n, v2) < h_max * weight(v, v2) }
   h_max = 2 ** 256  # Maximum value for a 256-bit hash
   N = 1 # N and P are constants to produce two different hash functions.
-  all_validators = setof(v, (_, s) in slices, v in s)
-  return setof(v2, v2 in all_validators, int(gi(i, 0, f"{N}:{n}:{v2}"), 16) < h_max * weight((threshold, slices), v2)) ## pass 0 in place of xi_minus_1 for now
+  ## qc._slices_with's keys are exactly the validators appearing in some slice of qc.v's own
+  ## D (qc.weight is 0 for anything else) - the same candidate pool the old all_validators was;
+  ## peers gives us the str(id) -> real process id mapping back, since qc's graph is str-keyed
+  by_str = {str(p): p for p in peers}
+  return setof(by_str[v2], v2 in qc._slices_with, int(gi(i, 0, f"{N}:{n}:{v2}"), 16) < h_max * qc.weight(v2)) ## pass 0 in place of xi_minus_1 for now
 
 def priority(n, v2):
   # priority(n, v2) = gi(P, n, v2)
   P = 2 # N and P are constants to produce two different hash functions.
   return int(gi(P, 0, f"{P}:{n}:{v2}"), 16) ## pass 0 in place of xi_minus_1 for now
 
-def max_priority_neighbor(D, n, i):
-  neighbors_set = neighbors(D, n, i)
+def max_priority_neighbor(qc, peers, n, i):
+  neighbors_set = neighbors(qc, peers, n, i)
   if not neighbors_set:
     return None
   return max((priority(n, v2), v2) for v2 in neighbors_set)[1]
@@ -87,18 +65,26 @@ class SCPNode(process, Node):
     super().setup(name, debugNames, log_file)
     self.protocol_messages = PROTOCOL_MESSAGES
     self.state_per_slot = dict()  ## To maintain the state per slot #? should this be a set instead of dict?
-    self.quorum_checker = QuorumChecker(self, D)
+    self.qc = quorum.QuorumChecker2(str(self), D) ## qc builds and owns its own quorum_graph
     ## map of peers (node ids and their quorum config) based on quorum slices
     for node in setof(n, (_, v) in D[1], n in v):
       self.peers[node] = None
     self.peers[self] = D
     # output(f'Node {self} initialized with quorum slices: {D} and peers: {self.peers}')
 
+  ## every protocol message (NOMINATE/PREPARE/CONFIRM/EXTERNALIZE) carries sender as its
+  ## 2nd field and D as its last, same as node.da's own peers[sender]=D catchall - so learn
+  ## it into qc here once, instead of repeating a qc.add(...) call in each receive handler
+  def receive(msg=m):
+    if m[0] in self.protocol_messages:
+      sender, D = m[1], m[-1]
+      self.qc.add(str(sender), D)
+
   def receive(msg=('TRANSACTION', i, value)):
     # This is a message from a client adding a value for slot i.
     is_new_slot = i not in self.state_per_slot
     state = self.state_per_slot.setdefault(i, State(i, self.D)) ## retrieve or initialize the state for mentioned slot
-    if state.v_n is None: state.v_n = max_priority_neighbor(self.D, state.n, state.slot)
+    if state.v_n is None: state.v_n = max_priority_neighbor(self.qc, self.peers, state.n, state.slot)
     if update_nomination_state(state):
       send_nomination(state)
     if is_new_slot: search_leader(state)
@@ -124,7 +110,7 @@ class SCPNode(process, Node):
       if await(state.X):
         break
       elif timeout(TIMEOUT):
-        increment_n(state, self.D) ## increment nomination round number for this slot
+        increment_n(state, self.qc, self.peers) ## increment nomination round number for this slot
         if update_nomination_state(state): send_nomination(state) ## send nomination request message to peers for this slot based on updated n
     await_candidate(state)
 
@@ -138,14 +124,14 @@ class SCPNode(process, Node):
       if await(state.Z):
         break
       elif timeout(TIMEOUT):
-        increment_n(state, self.D) ## increment nomination round number for this slot
+        increment_n(state, self.qc, self.peers) ## increment nomination round number for this slot
         if update_nomination_state(state): send_nomination(state) ## send nomination request message to peers for this slot based on updated n
     log(f'{self} now has candidate value Z={state.Z} for slot {state.slot}')
     send_message(state)
 
-  def increment_n(state:State, D):
+  def increment_n(state:State, qc, peers):
     state.n += 1
-    state.v_n = max_priority_neighbor(D, state.n, state.slot)
+    state.v_n = max_priority_neighbor(qc, peers, state.n, state.slot)
 
   def update_nomination_state(state:State):
     # Each node v should initially find a node v0 ∈ neighbors(v, 0) that maximizes
@@ -165,7 +151,8 @@ class SCPNode(process, Node):
     accept_nominate_votes = setof((v, x), ('accept_nominate', v, x) in state.votes)
 
     for x1 in setof(x, (_, x) in nominate_votes, x not in state.Y):
-      if quorum_checker.is_in_quorum(setof((v, peers.get(v)), v in setof(v1, (v1, _x1) in nominate_votes) | setof(v2, (v2, _x1) in accept_nominate_votes))) or quorum_checker.is_blocking(setof(v, (v, _x1) in accept_nominate_votes)):
+      candidate_nodes = setof(v1, (v1, _x1) in nominate_votes) | setof(v2, (v2, _x1) in accept_nominate_votes)
+      if qc.quorum({str(v) for v in candidate_nodes}) or qc.v_blocking({str(v) for v in setof(v, (v, _x1) in accept_nominate_votes)}):
         state.Y.add(x1)
         state.votes.add(('accept_nominate', self, x1)) ## add own accept_nominate vote for x1
 
@@ -173,7 +160,7 @@ class SCPNode(process, Node):
     # confirmed the statement nominate x—i.e., v has ratified accept (nominate x).
     ## move values from Y to Z based on candidate criteria
     for x2 in setof(x, (_, x) in accept_nominate_votes, x not in state.Z):
-      if x2 in state.Y and quorum_checker.is_in_quorum(setof((v, peers.get(v)), v in setof(v1, (v1, _x2) in accept_nominate_votes))):
+      if x2 in state.Y and qc.quorum({str(v) for v in setof(v1, (v1, _x2) in accept_nominate_votes)}):
         state.Z.add(x2)
         # updated = True ## reaching a candidate value should still trigger send_message even if X/Y are unchanged
 
@@ -184,7 +171,7 @@ class SCPNode(process, Node):
   def receive(msg=('NOMINATE', sender, i, X, Y, D)):
     is_new_slot = i not in self.state_per_slot
     state = self.state_per_slot.setdefault(i, State(i, self.D)) ## retrieve the state for mentioned slot
-    if state.v_n is None: state.v_n = max_priority_neighbor(self.D, state.n, state.slot)
+    if state.v_n is None: state.v_n = max_priority_neighbor(self.qc, self.peers, state.n, state.slot)
 
     ## Ignore if this is not a new nomination message
     if not state.add_nomination(sender, X, Y, D): return
@@ -314,8 +301,10 @@ class SCPNode(process, Node):
 
       ## highest b for which we have either a quorum of abort votes or a v-blocking set of abort votes for all b_old ⋦ b
       abort_ballots = setof(b, (_, _, b) in state.votes,
-                            quorum_checker.is_quorum_slice(setof(v, ('abort', v, _b) in state.votes)
-                                        | setof(v, ('accept_abort', v, _b) in state.votes)))
+                            qc.check_threshold(qc.quorum_graph[qc.v], qc.quorum_graph,
+                                                {str(v) for v in setof(v, ('abort', v, _b) in state.votes)
+                                                                | setof(v, ('accept_abort', v, _b) in state.votes)},
+                                                blocking=False))
       highest_aborted_ballot = max(abort_ballots) if abort_ballots else None
       if highest_aborted_ballot is None: return #? continue federated voting as no ballot can be accepted prepared
       ## find the smallest ballot higher than above ballot - this can be accepted as prepared

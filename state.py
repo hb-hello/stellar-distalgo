@@ -1,3 +1,6 @@
+# fmt: off
+## above comment for ruff to stop linting this as Python code
+
 INFINITY = 2 ** 31  ## A large number to represent infinity for ballot counters
 
 class Ballot:

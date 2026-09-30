@@ -1,6 +1,17 @@
 # type: ignore
 ## above comment for pylance to stop linting this as Python code
 
+from itertools import combinations
+
+def nCr(n, r):
+  if r > n or r < 0: return 0
+  if r == 0 or r == n: return 1
+  r = min(r, n - r)
+  result = 1
+  for i in range(r):
+    result *= (n - i) // (i + 1)
+  return result
+
 QUORUM_CONFIG = {
     # k-of-k2-of-n structurehow
     # Top-tier nodes: each trusts any 3 members of the top tier (including itself)
@@ -55,6 +66,21 @@ class QuorumChecker:
       else:
         for n2 in to_remove: nodes.discard(n2)
     return self.v in nodes
+
+  # weight(v, v2) = |{q | q ∈ Q(v) & v2 ∈ q}| / |Q(v)|
+  # The function weight (v, v2) returns the fraction of slices in Q(v) containing v2
+  def weight(self, v2):
+    threshold, slices = self.D
+    total = with_v = 0
+    for combo in combinations(slices, threshold):
+      p = 1
+      for s in combo: p *= nCr(len(s[1]), s[0])
+      total += p
+      if any(v2 in s[1] for s in combo):
+        q = 1
+        for s in combo: q *= nCr(len(s[1])-1, s[0]-1) if v2 in s[1] else nCr(len(s[1]), s[0])
+        with_v += q
+    return with_v / total if total > 0 else 0
 
   def is_blocking(self, selected_validators:set):
     t, s = self.D

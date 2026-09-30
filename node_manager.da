@@ -35,6 +35,37 @@ DISJOINT_LEADERS_CONFIG = {
   'judy':  {'threshold': 1, 'slices': [{'threshold': 2, 'validators': {'carol', 'dave', 'grace', 'heidi'}}]},
 }
 
+def _round_up_pct(n, pct):
+  return 1 + ((n * pct - 1) // 100)
+
+def _org_names(org, size):
+  return [f'{org}.n{i}' for i in range(size)]
+
+def _org_config(own, deps):
+  slices = [{'threshold': 1, 'validators': {v}} for v in own] + \
+           [{'threshold': _round_up_pct(len(dep), 51), 'validators': set(dep)} for dep in deps]
+  return {'threshold': _round_up_pct(len(own) + len(deps), 67), 'slices': slices}
+
+def _orgs_config(orgs, deps_by_org):
+  config = {}
+  for i, deps in deps_by_org.items():
+    node_cfg = _org_config(orgs[i], [orgs[j] for j in deps])
+    for v in orgs[i]:
+      config[v] = node_cfg
+  return config
+
+_ALL4 = {'alice', 'bob', 'carol', 'dave'}
+BASIC_4NODE_CONFIG = {n: {'threshold': 1, 'slices': [{'threshold': 2, 'validators': _ALL4 - {n}}]} for n in _ALL4}
+
+_ORGS3 = {i: _org_names(f'org{i}', 3) for i in range(3)}
+CLOSED_RING_3ORG_CONFIG = _orgs_config(_ORGS3, {0: [1, 2], 1: [0, 2], 2: [0, 1]})
+
+_ORGS8 = {i: _org_names(f'org{i}', 3 if i < 4 else 2) for i in range(8)}
+BALANCED_8ORG_CONFIG = _orgs_config(_ORGS8, {
+  0: [1, 2, 3, 4, 6], 1: [0, 2, 3, 4, 5], 2: [0, 1, 3, 6, 7], 3: [0, 1, 2, 5, 7],
+  4: [0, 1], 5: [1, 3], 6: [0, 2], 7: [2, 3],
+})
+
 ## Owns the lifecycle of a test round's node processes 
 class NodeManager(process):
   def setup():
