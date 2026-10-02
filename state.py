@@ -129,6 +129,10 @@ class State:
     self.M = set() # Set of the latest ballot message seen from each node - the latest message received from each node #?should be a map indexed on node id
     self.votes = set() ## set of conceptual statements based on messages
 
+    self.fbas = set() ## (node, vote-or-accept, statement) - stands in for VoteManager.stmts
+    self.fbas_accepted = set() ## statements self has accepted
+    self.fbas_confirmed = set() ## stands in for VoteManager.confirmed
+
     # Each node initializes its slot state by setting phi to PREPARE, b to ⟨0, z⟩,
     # M to empty set, and all other fields (p, p2, c, h) to invalid ballot 0.
 

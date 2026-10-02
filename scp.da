@@ -60,9 +60,9 @@ def max_priority_neighbor(qc, peers, n, i):
   return max((priority(n, v2), v2) for v2 in neighbors_set)[1]
 
 class SCPNode(process, Node):
-  def setup(D:tuple, name, debugNames, log_file):
+  def setup(D:tuple, name, debugNames, log_file, logs_dir='logs'):
     # D is node v’s quorum slice Q(v) or a collision-resistant hash of Q(v)
-    super().setup(name, debugNames, log_file)
+    super().setup(name, debugNames, log_file, logs_dir)
     self.protocol_messages = PROTOCOL_MESSAGES
     self.state_per_slot = dict()  ## To maintain the state per slot #? should this be a set instead of dict?
     self.qc = quorum.QuorumChecker2(str(self), D) ## qc builds and owns its own quorum_graph
@@ -72,9 +72,6 @@ class SCPNode(process, Node):
     self.peers[self] = D
     # output(f'Node {self} initialized with quorum slices: {D} and peers: {self.peers}')
 
-  ## every protocol message (NOMINATE/PREPARE/CONFIRM/EXTERNALIZE) carries sender as its
-  ## 2nd field and D as its last, same as node.da's own peers[sender]=D catchall - so learn
-  ## it into qc here once, instead of repeating a qc.add(...) call in each receive handler
   def receive(msg=m):
     if m[0] in self.protocol_messages:
       sender, D = m[1], m[-1]
@@ -141,27 +138,30 @@ class SCPNode(process, Node):
     if state.v_n == self:
       state.X |= setof(x, received(('TRANSACTION', state.slot, x))) ## adding new values to vote for nominations
     else:
-      state.X |= setof(x, ('nominate', state.v_n, x) in state.votes) ## echoing current leader's nominate votes
-      #? distalgo question for above: I want to filter out triples in state.votes with the middle value equal to state.v_n but 
-      #? in this case I don't need to write it like _state.v_n?
-    state.votes |= setof(('nominate', self, x), x in state.X)
+      state.X |= setof(x, (state.v_n, 'vote', ('nominate', x)) in state.fbas) ## echoing current leader's nominate votes
+    for x in state.X:
+      self.fbas_add(state, self, stmt=('nominate', x))
+    state.Y |= setof(x, ('nominate', x) in state.fbas_accepted)
+    state.Z |= setof(x, ('nominate', x) in state.fbas_confirmed)
 
-    ## move values from X to Y based on federated voting
-    nominate_votes = setof((v, x), ('nominate', v, x) in state.votes)
-    accept_nominate_votes = setof((v, x), ('accept_nominate', v, x) in state.votes)
-
-    for x1 in setof(x, (_, x) in nominate_votes, x not in state.Y):
-      candidate_nodes = setof(v1, (v1, _x1) in nominate_votes) | setof(v2, (v2, _x1) in accept_nominate_votes)
-      if qc.quorum({str(v) for v in candidate_nodes}) or qc.v_blocking({str(v) for v in setof(v, (v, _x1) in accept_nominate_votes)}):
-        state.Y.add(x1)
-        state.votes.add(('accept_nominate', self, x1)) ## add own accept_nominate vote for x1
+    # state.votes |= setof(('nominate', self, x), x in state.X)
+    #
+    # ## move values from X to Y based on federated voting
+    # nominate_votes = setof((v, x), ('nominate', v, x) in state.votes)
+    # accept_nominate_votes = setof((v, x), ('accept_nominate', v, x) in state.votes)
+    #
+    # for x1 in setof(x, (_, x) in nominate_votes, x not in state.Y):
+    #   candidate_nodes = setof(v1, (v1, _x1) in nominate_votes) | setof(v2, (v2, _x1) in accept_nominate_votes)
+    #   if qc.quorum({str(v) for v in candidate_nodes}) or qc.v_blocking({str(v) for v in setof(v, (v, _x1) in accept_nominate_votes)}):
+    #     state.Y.add(x1)
+    #     state.votes.add(('accept_nominate', self, x1)) ## add own accept_nominate vote for x1
 
     # A node v considers a value x to be a candidate when v has
     # confirmed the statement nominate x—i.e., v has ratified accept (nominate x).
     ## move values from Y to Z based on candidate criteria
-    for x2 in setof(x, (_, x) in accept_nominate_votes, x not in state.Z):
-      if x2 in state.Y and qc.quorum({str(v) for v in setof(v1, (v1, _x2) in accept_nominate_votes)}):
-        state.Z.add(x2)
+    # for x2 in setof(x, (_, x) in accept_nominate_votes, x not in state.Z):
+    #   if x2 in state.Y and qc.quorum({str(v) for v in setof(v1, (v1, _x2) in accept_nominate_votes)}):
+    #     state.Z.add(x2)
         # updated = True ## reaching a candidate value should still trigger send_message even if X/Y are unchanged
 
     ## X and Y are both final for this call now - this is the one true check for whether
@@ -180,10 +180,12 @@ class SCPNode(process, Node):
     # This concrete message encodes the following conceptual messages:
     # — { nominate x ∣ x ∈ X } (votes to nominate each value in X)
     for x in X:
-      state.votes.add(('nominate', sender, x))
+      # state.votes.add(('nominate', sender, x))
+      self.fbas_add(state, sender, stmt=('nominate', x))
     # — { accept (nominate x) ∣ x ∈ Y } (votes to confirm nominations in Y)
     for y in Y:
-      state.votes.add(('accept_nominate', sender, y))
+      self.fbas_add(state, sender, typ='accept', stmt=('nominate', y))
+      # state.votes.add(('accept_nominate', sender, y))
 
     #c nodes broadcast their state whenever there is an update in state
     if update_nomination_state(state):
@@ -241,11 +243,17 @@ class SCPNode(process, Node):
 
     # This concrete message encodes a host of conceptual statements, as follows:
     # — {abort b2 ∨ accept(abort b2 ) ∣ b2 ⋦ b} (a vote to prepare b)
+    statements.update({('prepare', v, b)})
     statements.update({('abort', v, b2) for b2 in setof(ballot, ('accept_abort', _, ballot) in state.votes, ballot.lt_nc(b))}) #? Do we check in accept statements from all nodes?
     # — {accept(abort b2 ) ∣ b2 ⋦ p} (a vote to confirm p is prepared)
-    if p.n != 0: statements.update({('accept_abort', v, Ballot(n=b2, x=p.x)) for b2 in range(0, p.n)})
+    # Definition (confirm). A quorum U_a in an FBAS confirms a statement a iff ∀v ∈ U_a, v claims to accept a. A node confirms a iff it is in such a quorum.
+    if p.n != 0: 
+      statements.update({('accept_abort', v, Ballot(n=b2, x=p.x)) for b2 in range(0, p.n)})
+      statements.update({('accept_prepare', v, p)})
     # — {accept(abort b2 ) ∣ b2 ⋦ p2 } (a vote to confirm p2 is prepared)
-    if p2.n != 0: statements.update({('accept_abort', v, Ballot(n=b2, x=p2.x)) for b2 in range(0, p2.n)})
+    if p2.n != 0: 
+      statements.update({('accept_abort', v, Ballot(n=b2, x=p2.x)) for b2 in range(0, p2.n)})
+      statements.update({('accept_prepare', v, p2)})
     # — {commit b2 ∣ c.n ≠ 0 ∧ c ≲ b2 ≲h} (a vote to commit c,…,ℎ if c ≠ 0)
     if c_n != 0: statements.update({('commit', v, Ballot(n=b2, x=b.x)) for b2 in range(c_n, h_n+1)})
 
@@ -256,8 +264,7 @@ class SCPNode(process, Node):
     ## received a message from v with a vote to prepare b,
     ## a vote to confirm p and p2 are prepared which means that v is claiming to accept p and p2
     ## a vote to commit c,...,h if c != 0, which means that v is claiming to accept c,...,h are prepared
-
-
+    
   def receive(msg=('CONFIRM', v, i, b, p_n, c_n, h_n, D)):
     state = self.state_per_slot.setdefault(i) ## retrieve the state for mentioned slot
     statements = set()
@@ -281,6 +288,26 @@ class SCPNode(process, Node):
   ###   # Encodes:
   ###   # — Everything implied by CONFIRM v i ⟨infinity, x⟩ infinity c.n infinity D
   ###   # — Everything implied by CONFIRM v i ⟨infinity, x⟩ infinity c.n h.n {{v}}
+
+  ## for (1) where m lets v accept new ballots - just count commits that don't clash with aborts. a quorum of commits 
+  ## or vblocking of accept_commits (from confirm) would do 
+  # def accept_prepare(state, b):
+  #   ## TODO: avoid clash with aborts here, also add own votes signifying accepting prepare?
+  #   if qc.v_blocking(setof(str(v), ('commit', v, _b) in state.votes)) or qc.quorum(setof(str(v), (vote, v, _b) in state.votes, vote in {'accept_commit', 'commit'})):
+  #     if b.gt_nc(state.p):
+  #       state.p2 = state.p
+  #       state.p = b
+  #     elif b.gt_c(state.p):
+  #       state.p = b
+  #     elif b > state.p2: state.p2 = b
+  #
+  # def update_state(state, b, p, p2=Ballot(0, None)):
+  #   ## first figure out own votes, at least which aborts self is accepting, to figure out which commits self can accept
+  #
+  #
+  #   if state.phi == 'PREPARE':
+  #     [accept_prepare(state, b2) for b2 in (b, p, p2)]
+  #
 
 
   def update_state(i:int):
@@ -318,7 +345,7 @@ class SCPNode(process, Node):
       # (2) If phi = PREPARE and m lets v confirm new higher ballots prepared, then raise h
       # to the highest such ballot and set z to h.x.
       if confirm_condition: #? what is m lets v confirm new higher ballots prepared? some condition on how many prepare messages v receives?
-        h_candidates = [message[7] for message in state.M if message[0] == 'PREPARE' and message[7] > state.h.n]
+        h_candidates = [message[7] for message in state.M.values() if message[0] == 'PREPARE' and message[7] > state.h.n]
         if h_candidates:
           state.h = Ballot(max(h_candidates), state.b.x)
           state.z = state.h.x
@@ -366,6 +393,28 @@ class SCPNode(process, Node):
     # the lowest counter for which no such S exists. Repeat the previous steps after
     # updating b
     #? v-blocking condition?
+
+  def fbas_add(state, node, typ='vote', stmt=None):
+    if stmt is None: return
+
+    state.fbas.add((node, typ, stmt))
+
+    if fbas_confirmed(state, stmt): return
+
+    voted = setof(str(n), (n, 'vote', _stmt) in state.fbas)
+    accepted = setof(str(n), (n, 'accept', _stmt) in state.fbas)
+    own_accept = (self, 'accept', stmt)
+    if not own_accept in accepted and (qc.quorum(voted | accepted) or qc.v_blocking(accepted)):
+      state.fbas.add((self, 'accept', stmt))
+      state.fbas_accepted.add(stmt)
+
+    if qc.quorum(accepted): state.fbas_confirmed.add(stmt)
+
+  def fbas_accepted(state, stmt):
+    return stmt in state.fbas_accepted
+
+  def fbas_confirmed(state, stmt):
+    return stmt in state.fbas_confirmed
 
 class Client(process):
   def setup(nodes:dict):

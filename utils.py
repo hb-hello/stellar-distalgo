@@ -15,10 +15,10 @@ def replace_node_ids(s, debug_names: dict):
     return s
 
 
-def log_to_file(filename: str, s: str, debug_names: dict):
+def log_to_file(filename: str, s: str, debug_names: dict, logs_dir: str = 'logs'):
     line = replace_node_ids(s, debug_names)
-    os.makedirs('logs', exist_ok=True)
-    with open(os.path.join('logs', filename), 'a') as f:
+    os.makedirs(logs_dir, exist_ok=True)
+    with open(os.path.join(logs_dir, filename), 'a') as f:
         f.write(f'[{datetime.now().isoformat()}] {line}\n')
 
 

@@ -9,4 +9,5 @@ test.py
 stellar-core/
 test_results/
 logs/
+test_logs/
 examples/

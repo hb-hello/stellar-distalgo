@@ -1,9 +1,10 @@
 from utils import hash_msg, replace_node_ids, log_to_file, archive_logs
 
 archive_logs() ## runs once, when this module is first imported, before any node starts writing this run's log file
+archive_logs('test_logs')
 
 class Node(process):
-  def setup(name, debugNames, log_file):
+  def setup(name, debugNames, log_file, logs_dir='logs'):
     self.name = name
     self.debug_names = debugNames  ## maps str(node id) -> node name, so output() can de-anonymize ids in log lines
     self.peers = {}
@@ -15,7 +16,7 @@ class Node(process):
     super().output(f'[{self.name}] {replace_node_ids(s, self.debug_names)}')
 
   def log(s):
-    if s: log_to_file(self.log_file, s, self.debug_names)
+    if s: log_to_file(self.log_file, s, self.debug_names, self.logs_dir)
 
   def send(msg, to, debugOnly=False, withLog=None):
     if msg[0] in self.protocol_messages:
