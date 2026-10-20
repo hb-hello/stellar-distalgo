@@ -12,8 +12,8 @@ def as_tuple(value):
 PROTOCOL_MESSAGES = {'NOMINATE'}
 
 class SCPNodeX(process, SCPNode):
-  def setup(D, checker, name, debugNames, log_file, test_id, logs_dir='test_logs'):
-    super().setup(D, name, debugNames, log_file, logs_dir)
+  def setup(D, peers, checker, name, debugNames, log_file, test_id, crashed=False, logs_dir='test_logs'):
+    super().setup(D, peers, name, debugNames, log_file, logs_dir, crashed)
     self.protocol_messages = PROTOCOL_MESSAGES
     self.test_id = test_id
 

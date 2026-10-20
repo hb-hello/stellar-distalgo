@@ -17,34 +17,30 @@ def build_checker(v, node_specs):
 ## Cases adapted from stellar-core's examples/QuorumIntersectionTests.cpp
 class TestQuorumIntersection(unittest.TestCase):
   def test_basic_4node_intersects(self):
-    qc = build_checker(
-      "A",
-      {
-        "A": (2, {"B", "C", "D"}),
-        "B": (2, {"A", "C", "D"}),
-        "C": (2, {"A", "B", "D"}),
-        "D": (2, {"A", "B", "C"}),
-      },
-    )
+    node_specs = {
+      "A": (2, {"B", "C", "D"}),
+      "B": (2, {"A", "C", "D"}),
+      "C": (2, {"A", "B", "D"}),
+      "D": (2, {"A", "B", "C"}),
+    }
+    qc = build_checker("A", node_specs)
     self.assertTrue(
-      QuorumIntersectionChecker(qc.quorum_graph).has_quorum_intersection()
+      QuorumIntersectionChecker(node_specs).has_quorum_intersection()
     )
     self.assertTrue(qc.quorum({"A", "B", "C"}))
     self.assertTrue(qc.v_blocking({"B", "C"}))
     self.assertFalse(qc.v_blocking({"B"}))
 
   def test_basic_4node_non_intersecting(self):
-    qc = build_checker(
-      "A",
-      {
-        "A": (1, {"B", "C", "D"}),
-        "B": (1, {"A", "C", "D"}),
-        "C": (1, {"A", "B", "D"}),
-        "D": (1, {"A", "B", "C"}),
-      },
-    )
+    node_specs = {
+      "A": (1, {"B", "C", "D"}),
+      "B": (1, {"A", "C", "D"}),
+      "C": (1, {"A", "B", "D"}),
+      "D": (1, {"A", "B", "C"}),
+    }
+    qc = build_checker("A", node_specs)
     self.assertFalse(
-      QuorumIntersectionChecker(qc.quorum_graph).has_quorum_intersection()
+      QuorumIntersectionChecker(node_specs).has_quorum_intersection()
     )
     self.assertTrue(qc.v_blocking({"B", "C", "D"}))
     self.assertFalse(qc.v_blocking({"B", "C"}))
@@ -53,17 +49,15 @@ class TestQuorumIntersection(unittest.TestCase):
   ## quorum sets but itself absent, so no node can ever reach its threshold - the FBAS admits
   ## no quorum at all (NO_QUORUM, distinct from UNSAT/"enjoys intersection")
   def test_no_quorum_when_threshold_exceeds_reachable_degree(self):
-    qc = build_checker(
-      "A",
-      {
-        "A": (3, {"A", "B", "Ghost"}),
-        "B": (3, {"A", "B", "Ghost"}),
-        "C": (3, {"C", "D", "Ghost"}),
-        "D": (3, {"C", "D", "Ghost"}),
-      },
-    )
+    node_specs = {
+      "A": (3, {"A", "B", "Ghost"}),
+      "B": (3, {"A", "B", "Ghost"}),
+      "C": (3, {"C", "D", "Ghost"}),
+      "D": (3, {"C", "D", "Ghost"}),
+    }
+    qc = build_checker("A", node_specs)
     self.assertTrue(
-      QuorumIntersectionChecker(qc.quorum_graph).has_quorum_intersection()
+      QuorumIntersectionChecker(node_specs).has_quorum_intersection()
     )
     self.assertFalse(qc.quorum({"A", "B", "C", "D", "Ghost"}))
     ## Ghost can never be *in* a quorum, but it can still block one: threshold 3-of-3
@@ -92,19 +86,17 @@ class TestQuorumIntersection(unittest.TestCase):
       qs("C", "D", "E"),
     )
 
-    qc = build_checker(
-      "A",
-      {
-        "A": (2, frozenset({qsBDC, qsBDE, qsCDE})),
-        "B": (2, frozenset({qsACD, qsACE, qsACF})),
-        "C": (2, frozenset({qsABD, qsABE, qsABF})),
-        "D": (2, frozenset({qsABC, qsABE, qsABF})),
-        "E": (2, frozenset({qsABC, qsABD, qsABF})),
-        "F": (2, frozenset({qsABC, qsABD, qsABE})),
-      },
-    )
+    node_specs = {
+      "A": (2, frozenset({qsBDC, qsBDE, qsCDE})),
+      "B": (2, frozenset({qsACD, qsACE, qsACF})),
+      "C": (2, frozenset({qsABD, qsABE, qsABF})),
+      "D": (2, frozenset({qsABC, qsABE, qsABF})),
+      "E": (2, frozenset({qsABC, qsABD, qsABF})),
+      "F": (2, frozenset({qsABC, qsABD, qsABE})),
+    }
+    qc = build_checker("A", node_specs)
     self.assertTrue(
-      QuorumIntersectionChecker(qc.quorum_graph).has_quorum_intersection()
+      QuorumIntersectionChecker(node_specs).has_quorum_intersection()
     )
     ## blocking a nested group: {B,D} blocks 2 of A's 3 inner sets (qsBDC, qsBDE),
     ## meeting A's own 2-of-3 blocking threshold
@@ -140,23 +132,21 @@ class TestQuorumIntersection(unittest.TestCase):
       frozenset({"COINQVEST1", "COINQVEST2", sdf_1of3, satoshi_2of3, lobstr}),
     )
 
-    qc = build_checker(
-      "SDF1",
-      {
-        "SDF1": D_sdf,
-        "SDF2": D_sdf,
-        "SDF3": D_sdf,
-        "Satoshi1": D_satoshi,
-        "Satoshi2": D_satoshi,
-        "Satoshi3": D_satoshi,
-        "LOBSTR1": D_lobstr,
-        "LOBSTR2": D_lobstr,
-        "COINQVEST1": D_coinqvest,
-        "COINQVEST2": D_coinqvest,
-      },
-    )
+    node_specs = {
+      "SDF1": D_sdf,
+      "SDF2": D_sdf,
+      "SDF3": D_sdf,
+      "Satoshi1": D_satoshi,
+      "Satoshi2": D_satoshi,
+      "Satoshi3": D_satoshi,
+      "LOBSTR1": D_lobstr,
+      "LOBSTR2": D_lobstr,
+      "COINQVEST1": D_coinqvest,
+      "COINQVEST2": D_coinqvest,
+    }
+    qc = build_checker("SDF1", node_specs)
     self.assertFalse(
-      QuorumIntersectionChecker(qc.quorum_graph).has_quorum_intersection()
+      QuorumIntersectionChecker(node_specs).has_quorum_intersection()
     )
 
   ## quorum intersection 8-org core-and-periphery dangling: "looks kinda strong" but still
@@ -218,7 +208,7 @@ class TestQuorumIntersection(unittest.TestCase):
 
     qc = build_checker("org0.n0", node_specs)
     self.assertFalse(
-      QuorumIntersectionChecker(qc.quorum_graph).has_quorum_intersection()
+      QuorumIntersectionChecker(node_specs).has_quorum_intersection()
     )
 
 

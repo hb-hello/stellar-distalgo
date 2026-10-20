@@ -14,7 +14,7 @@ QUORUM_CONFIG = {
 
 class NodeX(process, Node):
   def setup(checker, name, debugNames, log_file, logs_dir='test_logs'):
-    super().setup(name, debugNames, log_file, logs_dir)
+    super().setup(set(), name, debugNames, log_file, logs_dir)
     self.protocol_messages = PROTOCOL_MESSAGES
     self.c = 0
 

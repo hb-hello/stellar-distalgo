@@ -1,0 +1,147 @@
+# type: ignore
+import sys, time, ast
+from datetime import datetime
+from scp import SCPNode, combine
+from client import Client
+from quorum_intersection import QuorumIntersectionChecker
+import node_manager
+from node_manager import NodeManager
+
+TIMEOUT = 30
+
+STATE_FIELDS = ('slot', 'n', 'X', 'Y', 'Z', 'phi', 'b', 'p', 'p2', 'c', 'h', 'z')
+
+class CState:
+  def __init__(self, state):
+    for f in STATE_FIELDS:
+      v = getattr(state, f)
+      setattr(self, f, frozenset(v) if isinstance(v, set) else v)
+
+class SCPNodeC(process, SCPNode):
+  def setup(D, peers, checker, name, debugNames, log_file, test_id, crashed=False, slow=None, logs_dir='test_logs'):
+    super().setup(D, peers, name, debugNames, log_file, logs_dir, crashed)
+    self.test_id = test_id
+
+  def receive(msg=m):
+    if slow and m[0] in self.protocol_messages:
+      delay, slots, types = slow
+      if m[2] in slots and m[0] in types:
+        time.sleep(delay)
+
+  def send(msg, to, debugOnly=False, withLog=None):
+    if checker in to:
+      msg = (self.test_id,) + msg
+    elif msg[0] in self.protocol_messages and msg[1] == self:
+      send(('state', msg[2], msg, CState(self.state_per_slot[msg[2]]), logical_clock(), time.time()), to={ checker })
+    super().send(msg, to=to, debugOnly=debugOnly, withLog=withLog)
+
+  def timer_armed(state):
+    super().timer_armed(state)
+    send(('armed', state.slot, state.b.n, logical_clock(), time.time()), to={ checker })
+
+  def increment_ballot(state):
+    send(('fired', state.slot, state.b.n, logical_clock(), time.time()), to={ checker })
+    super().increment_ballot(state)
+
+  def receive(msg=('terminate',), from_=checker):
+    send(('done',), to={ checker })
+    exit()
+
+  def run():
+    send(('ready',), to={ checker })
+    await(False)
+
+class Checker(process, Client, NodeManager):
+  def setup(name, quorum_config, slot_range, crashed, slow):
+    super().setup()
+    self.name = name
+    self.log_file = f'scp_log_{datetime.now().strftime("%Y%m%dT%H%M%S")}.txt'
+    self.test_id = 1
+
+  def output(s):
+    super().output(f'[{self.name}] {s}')
+
+  def run():
+    spawn_nodes(quorum_config, SCPNodeC, test_id, log_file, crashed, {n: (spec,) for n, spec in slow.items()})
+    send_all_different(slot_range, self.nodes)
+    if await(each(i in slot_range, has=validate_nomination(i) and theorem_12(i) and all_externalized(i))): pass
+    elif timeout(TIMEOUT): output('timed out')
+    output('___checking:')
+    for i in slot_range:
+      output(f'validate_nomination({i}): {validate_nomination(i)}')
+      output(f'theorem_12({i}): {theorem_12(i)}')
+      output(f'theorem_13({i}): {theorem_13(i)} ({len(externalized(i))} externalized)')
+      output(f'theorem_14({i}): {theorem_14(i)} ({len(setof(m, received(m), m[1:3] == ("armed", i)))} armed, {len(setof(m, received(m), m[1:3] == ("fired", i)))} fired)')
+    teardown_nodes()
+    send(('done',), to=parent())
+
+  # Intact nodes can produce at least one candidate value for slot i.
+  def validate_nomination(i):
+    return each(n in intact_nodes(), has=
+      some(received((_test_id, 'state', _i, _, s, _, _), from_=_n), has=s.Z))
+
+  # Theorem 12. Eventually, all intact nodes will have the same composite value.
+  def theorem_12(i):
+    return len(setof(combine(s.Z), n in intact_nodes(),
+      received((_test_id, 'state', _i, _, s, lc, _), from_=_n),
+      lc == maxof(lc2, received((_test_id, 'state', _i, _, _, lc2, _), from_=_n)))) == 1
+
+  # THEOREM 13. Let ⟨V1, Q1⟩, … , ⟨Vk, Qk⟩ be the set of configurations an FBAS has
+  # experienced during agreement on a single slot. Let V = V1 ∪ ⋯ ∪ Vk and Q(v) = { q ∣
+  # ∃j such that v ∈ Vj ∧ q ∈ Qj(v) }. Let B ⊆ V be a set such that B contains all ill-
+  # behaved nodes that have sent illegal messages, though V ⧵ B may still contain crashed
+  # (unresponsive) nodes. Suppose nodes v1 and v2 are well-behaved, v1 externalizes x1 for
+  # the slot, and v2 externalizes x2. If ⟨V, Q⟩B enjoys quorum intersection, then x1 = x2
+  ## Assuming no ill-behaved nodes for now
+  def theorem_13(i):
+    
+    Qs = setof((n, m[-1]), n in self.nodes.values(),
+      received((_test_id, 'state', _i, m, _, _, _), from_=_n)) | set(self.node_Ds.items())
+    
+    V_Q = {}
+    for v in setof(v, (v, _) in Qs):
+      Ds = setof(D, (_v, D) in Qs)
+      V_Q[v] = next(iter(Ds)) if len(Ds) == 1 else (1, frozenset(Ds))
+    
+    if not QuorumIntersectionChecker(V_Q).has_quorum_intersection():
+      output(f'theorem_13({i}): no quorum intersection, inapplicable')
+      return True
+    
+    return len(setof(x, (_, x) in externalized(i))) <= 1
+
+  # THEOREM 14. In an FBAS with quorum intersection, if no intact node is in the
+  # EXTERNALIZE phase and an intact node with ballot ⟨n, x⟩ arms its timer as described
+  # in Section 6.2.2, then, given sufficient communication, every intact node v can set b_v ≥ n
+  # before any timer fires
+  def theorem_14(i):
+
+    def first_fired_after(t_arm):
+      return min(setof(t, v in intact_nodes(), received((_test_id, 'fired', _i, _, _, t), from_=_v), t > t_arm) | {float('inf')})
+    
+    if not QuorumIntersectionChecker(self.node_Ds).has_quorum_intersection():
+      output(f'theorem_14({i}): no quorum intersection, inapplicable')
+      return True
+    
+    return each(u in intact_nodes(), has=
+      each(received((_test_id, 'armed', _i, n, _, t_arm), from_=_u), has=
+        some(v in intact_nodes(), has=some(received((_test_id, 'state', _i, _, s, _, t), from_=_v), has=s.phi == 'EXTERNALIZE' and t <= t_arm))
+        or each(v in intact_nodes(), has=
+          some(received((_test_id, 'state', _i, _, s, _, t), from_=_v), has=s.b.n >= n and t <= first_fired_after(t_arm)))))
+
+  def all_externalized(i):
+    return each(n in intact_nodes(), has=some((_n, _) in externalized(i)))
+
+  def externalized(i):
+    return setof((n, s.c.x), n in self.nodes.values(),
+      received((_test_id, 'state', _i, _, s, _, _), from_=_n), s.phi == 'EXTERNALIZE')
+
+def main():
+  config(channel is reliable, clock=lamport)
+  quorum_config = getattr(node_manager, sys.argv[1]) if len(sys.argv) > 1 else node_manager.DEFAULT_QUORUM_CONFIG
+  nslots = int(sys.argv[2]) if len(sys.argv) > 2 else 1
+  crashed = set(filter(None, sys.argv[3].split(','))) if len(sys.argv) > 3 else set()
+  slow = ast.literal_eval(sys.argv[4]) if len(sys.argv) > 4 else {}
+  checker = new(Checker, ['checker', quorum_config, range(1, nslots + 1), crashed, slow], num=1)
+  start(checker)
+  await(received(('done',)))
+  end(checker)

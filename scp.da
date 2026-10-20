@@ -60,9 +60,9 @@ def max_priority_neighbor(qc, peers, n, i):
   return max((priority(n, v2), v2) for v2 in neighbors_set)[1]
 
 class SCPNode(process, Node):
-  def setup(D:tuple, name, debugNames, log_file, logs_dir='logs'):
+  def setup(D:tuple, peers, name, debugNames, log_file, logs_dir='logs', crashed=False):
     # D is node v’s quorum slice Q(v) or a collision-resistant hash of Q(v)
-    super().setup(name, debugNames, log_file, logs_dir)
+    super().setup(peers, name, debugNames, log_file, logs_dir, crashed)
     self.protocol_messages = PROTOCOL_MESSAGES
     self.state_per_slot = dict()  ## To maintain the state per slot #? should this be a set instead of dict?
     self.qc = quorum.QuorumChecker2(str(self), D) ## qc builds and owns its own quorum_graph
@@ -73,11 +73,13 @@ class SCPNode(process, Node):
     # output(f'Node {self} initialized with quorum slices: {D} and peers: {self.peers}')
 
   def receive(msg=m):
+    if self.crashed: return
     if m[0] in self.protocol_messages:
       sender, D = m[1], m[-1]
       self.qc.add(str(sender), D)
 
   def receive(msg=('TRANSACTION', i, value)):
+    if self.crashed: return
     # This is a message from a client adding a value for slot i.
     is_new_slot = i not in self.state_per_slot
     state = self.state_per_slot.setdefault(i, State(i, self.D)) ## retrieve or initialize the state for mentioned slot
@@ -95,10 +97,6 @@ class SCPNode(process, Node):
     # sender’s latest NOMINATE message and the return value is the receiver’s.
     msg = ('NOMINATE', self, state.slot, frozenset(state.X), frozenset(state.Y), self.D)
     send(msg, to=self.peers.keys() - {self}, withLog=f'{self} nominating with X={state.X}, Y={state.Y} for slot {1 if state.slot is True else state.slot}, round {state.n}')
-    # highest-priority node can optimistically initiate balloting at the same time as nom-
-    # ination, piggybacking its first ballot message PREPARE (described below) on its first
-    # NOMINATE message.
-    # send_message(state)
 
   def search_leader(state:State):
     ## keep trying to nominate new values by incrementing the round number (n)
@@ -109,6 +107,10 @@ class SCPNode(process, Node):
       elif timeout(TIMEOUT):
         increment_n(state, self.qc, self.peers) ## increment nomination round number for this slot
         if update_nomination_state(state): send_nomination(state) ## send nomination request message to peers for this slot based on updated n
+    # highest-priority node can optimistically initiate balloting at the same time as nom-
+    # ination, piggybacking its first ballot message PREPARE (described below) on its first
+    # NOMINATE message.
+    if state.v_n == self: send_message(state)
     await_candidate(state)
 
   def await_candidate(state:State):
@@ -125,6 +127,7 @@ class SCPNode(process, Node):
         if update_nomination_state(state): send_nomination(state) ## send nomination request message to peers for this slot based on updated n
     log(f'{self} now has candidate value Z={state.Z} for slot {state.slot}')
     send_message(state)
+    await_externalize(state)
 
   def increment_n(state:State, qc, peers):
     state.n += 1
@@ -139,36 +142,32 @@ class SCPNode(process, Node):
       state.X |= setof(x, received(('TRANSACTION', state.slot, x))) ## adding new values to vote for nominations
     else:
       state.X |= setof(x, (state.v_n, 'vote', ('nominate', x)) in state.fbas) ## echoing current leader's nominate votes
+
     for x in state.X:
       self.fbas_add(state, self, stmt=('nominate', x))
+
     state.Y |= setof(x, ('nominate', x) in state.fbas_accepted)
-    state.Z |= setof(x, ('nominate', x) in state.fbas_confirmed)
-
-    # state.votes |= setof(('nominate', self, x), x in state.X)
-    #
-    # ## move values from X to Y based on federated voting
-    # nominate_votes = setof((v, x), ('nominate', v, x) in state.votes)
-    # accept_nominate_votes = setof((v, x), ('accept_nominate', v, x) in state.votes)
-    #
-    # for x1 in setof(x, (_, x) in nominate_votes, x not in state.Y):
-    #   candidate_nodes = setof(v1, (v1, _x1) in nominate_votes) | setof(v2, (v2, _x1) in accept_nominate_votes)
-    #   if qc.quorum({str(v) for v in candidate_nodes}) or qc.v_blocking({str(v) for v in setof(v, (v, _x1) in accept_nominate_votes)}):
-    #     state.Y.add(x1)
-    #     state.votes.add(('accept_nominate', self, x1)) ## add own accept_nominate vote for x1
-
+    
     # A node v considers a value x to be a candidate when v has
     # confirmed the statement nominate x—i.e., v has ratified accept (nominate x).
-    ## move values from Y to Z based on candidate criteria
-    # for x2 in setof(x, (_, x) in accept_nominate_votes, x not in state.Z):
-    #   if x2 in state.Y and qc.quorum({str(v) for v in setof(v1, (v1, _x2) in accept_nominate_votes)}):
-    #     state.Z.add(x2)
-        # updated = True ## reaching a candidate value should still trigger send_message even if X/Y are unchanged
+    # move values from Y to Z based on candidate criteria
+    state.Z |= setof(x, ('nominate', x) in state.fbas_confirmed)
 
-    ## X and Y are both final for this call now - this is the one true check for whether
-    ## our own nomination content actually changed (and the one place state.N's self-record should be updated)
+    # Because nodes cannot tell when the nomination protocol is complete anyway, SCP
+    # must cope with different composite values at different nodes. As an optimization, then,
+    # nodes can attempt to predict the final composite value before they even have a candi-
+    # date value. To do this, the composite value can be taken as combine(Z) when Z ≠ <empty set>,
+    # otherwise combine(Y) when Y ≠ <empty set>, otherwise combine(X) when X ≠ <empty set>. This means the
+    # highest-priority node can optimistically initiate balloting at the same time as nom-
+    # ination, piggybacking its first ballot message PREPARE (described below) on its first
+    # NOMINATE message.
+    if state.h.n == 0:
+      state.z = combine(state.Z) if state.Z else (combine(state.Y) if state.Y else combine(state.X))
+
     return state.add_nomination(self, frozenset(state.X), frozenset(state.Y), self.D)
 
   def receive(msg=('NOMINATE', sender, i, X, Y, D)):
+    if self.crashed: return
     is_new_slot = i not in self.state_per_slot
     state = self.state_per_slot.setdefault(i, State(i, self.D)) ## retrieve the state for mentioned slot
     if state.v_n is None: state.v_n = max_priority_neighbor(self.qc, self.peers, state.n, state.slot)
@@ -176,16 +175,13 @@ class SCPNode(process, Node):
     ## Ignore if this is not a new nomination message
     if not state.add_nomination(sender, X, Y, D): return
 
-    #? consider moving below votes addition to state.add_nomination
     # This concrete message encodes the following conceptual messages:
     # — { nominate x ∣ x ∈ X } (votes to nominate each value in X)
     for x in X:
-      # state.votes.add(('nominate', sender, x))
       self.fbas_add(state, sender, stmt=('nominate', x))
     # — { accept (nominate x) ∣ x ∈ Y } (votes to confirm nominations in Y)
     for y in Y:
       self.fbas_add(state, sender, typ='accept', stmt=('nominate', y))
-      # state.votes.add(('accept_nominate', sender, y))
 
     #c nodes broadcast their state whenever there is an update in state
     if update_nomination_state(state):
@@ -195,16 +191,6 @@ class SCPNode(process, Node):
   # Fig. 17. Messages in SCP’s ballot protocol
 
   def send_message(state):
-    # Because nodes cannot tell when the nomination protocol is complete anyway, SCP
-    # must cope with different composite values at different nodes. As an optimization, then,
-    # nodes can attempt to predict the final composite value before they even have a candi-
-    # date value. To do this, the composite value can be taken as combine(Z) when Z ≠ <empty set>,
-    # otherwise combine(Y) when Y ≠ <empty set>, otherwise combine(X) when X ≠ <empty set>. This means the
-    # highest-priority node can optimistically initiate balloting at the same time as nom-
-    # ination, piggybacking its first ballot message PREPARE (described below) on its first
-    # NOMINATE message.
-    state.z = combine(state.Z) if state.Z else (combine(state.Y) if state.Y else combine(state.X))
-
     # Once z ≠ ⊥, if b.n = 0, a node
     # reinitializes b to ⟨1, z⟩ to start sending messages. Nodes then repeatedly exchange
     # messages with peers, sending whichever ballot message is indicated by phi.
@@ -216,183 +202,259 @@ class SCPNode(process, Node):
       # PREPARE v i b p p2 c.n h.n D
       # This is a message from node v about slot i. D specifies Q(v). The other fields
       # reflect v’s state. Values c.x and h.x are elided as c.x = h.x = b.x when c.n ≠ 0.
-      if state.add_message(('PREPARE', self, state.slot, state.b, state.p, state.p2, state.c.n, state.h.n, self.D)):
-        send(('PREPARE', self, state.slot, state.b, state.p, state.p2, state.c.n, state.h.n, self.D), to=self.peers.keys() - {self}, withLog=f'{self} preparing ballot b={state.b} for slot {state.slot}')
+      msg = ('PREPARE', self, state.slot, (state.b, state.p, state.p2, state.c.n, state.h.n), self.D)
+      if state.add_message(msg):
+        send(msg, to=self.peers.keys() - {self}, withLog=f'{self} preparing ballot b={state.b} for slot {state.slot}')
 
     elif state.phi == 'CONFIRM':
       # CONFIRM v i b p.n c.n h.n D
       # Sent by v to try to externalize b.x for slot i after accepting a commit. Implies
       # p.x = c.x = h.x = b.x in v’s state. For convenience, we also say p2 = 0 (p2 is
       # irrelevant after accepting commit). D specifies Q(v) as above.
-      if state.add_message(('CONFIRM', self, state.slot, Ballot(n=INFINITY, x=state.b.x), state.p.n, state.c.n, state.h.n, self.D)):
-        send(('CONFIRM', self, state.slot, Ballot(n=INFINITY, x=state.b.x), state.p.n, state.c.n, state.h.n, self.D), to=self.peers.keys() - {self})
+      msg = ('CONFIRM', self, state.slot, (state.b, state.p.n, state.c.n, state.h.n), self.D)
+      if state.add_message(msg):
+        send(msg, to=self.peers.keys() - {self})
 
     elif state.phi == 'EXTERNALIZE':
       # EXTERNALIZE v i x c.n h.n D
       # After v confirms commit ⟨c.n,x⟩ for slot i and externalizes value x, this
       # message helps other nodes externalize x. Implies c = ⟨c.n, x⟩ and h = ⟨h.n, x⟩.
       # For convenience, we also say b = p = h = ⟨infinity, x⟩, and p2 = 0.
-      if state.add_message(('EXTERNALIZE', self, state.slot, state.b.x, state.c.n, state.h.n, self.D)):
-        send(('EXTERNALIZE', self, state.slot, state.b.x, state.c.n, state.h.n, self.D), to=self.peers.keys() - {self})
+      msg = ('EXTERNALIZE', self, state.slot, (state.b.x, state.c.n, state.h.n), self.D)
+      if state.add_message(msg):
+        send(msg, to=self.peers.keys() - {self})
 
-  def receive(msg=('PREPARE', v, i, b, p, p2, c_n, h_n, D)):
-    state = self.state_per_slot.setdefault(i) ## retrieve the state for mentioned slot
+  
+  def voted_prepare(state, ballot):
+    ## all nodes with prepare b greater than and compatible with this ballot have voted to prepare this ballot
+    return (setof(str(vm), ('PREPARE', vm, _, f, _) in state.M, (bm, _, _, _, _) in {f}, bm.gt_c(ballot))
+      ## confirm b represents prepare INFINITY, b.x which counts as a vote to prepare all compatible ballots
+      | setof(str(vm), ('CONFIRM', vm, _, f, _) in state.M, (bm, _, _, _) in {f}, bm.x == ballot.x)
+      ## externalize x represents prepare INFINITY, x which counts as a vote to prepare all compatible ballots
+      | setof(str(vm), ('EXTERNALIZE', vm, _, f, _) in state.M, (xm, _, _) in {f}, xm == ballot.x))
+
+  def accepted_prepare(state, ballot):
+    ## all nodes with prepare p or p2 greater than and compatible with this ballot have accepted this ballot as prepared
+    return (setof(str(vm), ('PREPARE', vm, _, f, _) in state.M, (_, pm, p2m, _, _) in {f}, pm.gt_c(ballot) or p2m.gt_c(ballot))
+      ## confirm b p_n represents prepare with p as (p_n, b.x), similar to above these have accepted this ballot as prepared
+      | setof(str(vm), ('CONFIRM', vm, _, f, _) in state.M, (bm, p_nm, _, _) in {f}, Ballot(p_nm, bm.x).gt_c(ballot))
+      ## externalize x represents prepare with p as INFINITY, similar to above these have accepted this ballot as prepared
+      | setof(str(vm), ('EXTERNALIZE', vm, _, f, _) in state.M, (xm, _, _) in {f}, xm == ballot.x))
+
+  def accepts_prepare(state, ballot):
+    accepted = accepted_prepare(state, ballot)
+    return qc.quorum(voted_prepare(state, ballot) | accepted) or qc.v_blocking(accepted)
+
+  def voted_commit(state, ballot):
+    ## all nodes with prepare b, c, h represent the below vote commit for a ballot between c and h
+    # — {commit b2 ∣ c.n ≠ 0 ∧ c ≲ b2 ≲h} (a vote to commit c,…,ℎ if c ≠ 0)
+    return (setof(str(vm), ('PREPARE', vm, _, f, _) in state.M, (bm, _, _, c_nm, h_nm) in {f}, c_nm != 0, bm.x == ballot.x, c_nm <= ballot.n <= h_nm)
+      ## confirm implies prepare b, c, INFINITY, all nodes with c less than ballot vote commit on ballot
+      | setof(str(vm), ('CONFIRM', vm, _, f, _) in state.M, (bm, _, c_nm, _) in {f}, bm.x == ballot.x, c_nm <= ballot.n)
+      ## externalize implies the same as above
+      | setof(str(vm), ('EXTERNALIZE', vm, _, f, _) in state.M, (xm, c_nm, _) in {f}, xm == ballot.x, c_nm <= ballot.n))
+
+  def accepted_commit(state, ballot):
+    ## all nodes with confirm b, c, h represent below accept commit for ballot between c and h
+    # — {accept(commit b2 ) ∣ c ≲ b2 ≲h} (a vote to confirm commit c,…, h)
+    return (setof(str(vm), ('CONFIRM', vm, _, f, _) in state.M, (bm, _, c_nm, h_nm) in {f}, bm.x == ballot.x, c_nm <= ballot.n <= h_nm)
+      ## externalize x, c implies confirm b, c, INFINITY, all nodes with c less than ballot accepted commit for it
+      | setof(str(vm), ('EXTERNALIZE', vm, _, f, _) in state.M, (xm, c_nm, _) in {f}, xm == ballot.x, c_nm <= ballot.n))
+
+  def accepts_commit(state, ballot):
+    # Definition (accept). An FBAS node v accepts a statement a iff it has never accepted
+    # a statement contradicting a and it determines that either
+    # (1) There exists a quorum U such that v ∈ U and each member of U either voted for
+    # a or claims to accept a, or
+    # (2) Each member of a v-blocking set claims to accept a.
+    ## accepting p (or p2) prepared means accepting abort for everything ⋦ p, which contradicts commit
+    if state.p.gt_nc(ballot) or state.p2.gt_nc(ballot): return False
+    accepted = accepted_commit(state, ballot)
+    return qc.quorum(voted_commit(state, ballot) | accepted) or qc.v_blocking(accepted)
+
+  ## v accepts all { commit b2 ∣ lo ≲ b2 ≲ hi }
+  def accepts_commit_range(accepted, points, lo, hi):
+    return each(b2 in points, has=not (lo.lt_c(b2) and b2.lt_c(hi)) or b2 in accepted)
+
+  ## commit ballots where some sender's commit range starts, ends, or has just ended, plus where the
+  ## p/p2 contradiction stops - accepting commit can only change at these, so checking them stands in for checking every counter
+  def commit_points(state):
+    points = (setof(Ballot(n, bm.x), ('PREPARE', _, _, f, _) in state.M, (bm, _, _, c_nm, h_nm) in {f}, c_nm != 0, n in {c_nm, h_nm, min(h_nm + 1, INFINITY)})
+      | setof(Ballot(n, bm.x), ('CONFIRM', _, _, f, _) in state.M, (bm, _, c_nm, h_nm) in {f}, c_nm != 0, n in {c_nm, h_nm, min(h_nm + 1, INFINITY)})
+      | setof(Ballot(n, xm), ('EXTERNALIZE', _, _, f, _) in state.M, (xm, c_nm, _) in {f}, n in {c_nm, INFINITY}))
+    return points | setof(Ballot(q.n + 1, b.x), b in points, q in {state.p, state.p2}, q.n != 0, q.n < INFINITY)
+
+  ## every counter up to one past the highest finite counter in play, plus INFINITY - nothing changes in between
+  def commit_points_all(state):
+    values = setof(f[0] if t == 'EXTERNALIZE' else f[0].x, (t, _, _, f, _) in state.M)
+    counters = setof(n, (_, _, _, f, _) in state.M, n in f[-2:]) | {state.p.n, state.p2.n, state.b.n}
+    top = maxof(n, n in counters, n < INFINITY)
+    return setof(Ballot(n, x), x in values, n in set(range(1, top + 2)) | {INFINITY})
+
+
+  def receive(msg=('PREPARE', v, i, (b, p, p2, c_n, h_n), D)):
+    if self.crashed: return
+    state = self.state_per_slot.setdefault(i, State(i, self.D)) ## retrieve or initialize the state for mentioned slot
     statements = set()
 
-    if not state.add_message(('PREPARE', v, i, b, p, p2, c_n, h_n, D)): return ## Ignore if this is not a new message
+    if not state.add_message(('PREPARE', v, i, (b, p, p2, c_n, h_n), D)): return ## Ignore if this is not a new message
 
     # This concrete message encodes a host of conceptual statements, as follows:
     # — {abort b2 ∨ accept(abort b2 ) ∣ b2 ⋦ b} (a vote to prepare b)
-    statements.update({('prepare', v, b)})
-    statements.update({('abort', v, b2) for b2 in setof(ballot, ('accept_abort', _, ballot) in state.votes, ballot.lt_nc(b))}) #? Do we check in accept statements from all nodes?
+    state.seen_b.add(b)
     # — {accept(abort b2 ) ∣ b2 ⋦ p} (a vote to confirm p is prepared)
-    # Definition (confirm). A quorum U_a in an FBAS confirms a statement a iff ∀v ∈ U_a, v claims to accept a. A node confirms a iff it is in such a quorum.
-    if p.n != 0: 
-      statements.update({('accept_abort', v, Ballot(n=b2, x=p.x)) for b2 in range(0, p.n)})
-      statements.update({('accept_prepare', v, p)})
     # — {accept(abort b2 ) ∣ b2 ⋦ p2 } (a vote to confirm p2 is prepared)
-    if p2.n != 0: 
-      statements.update({('accept_abort', v, Ballot(n=b2, x=p2.x)) for b2 in range(0, p2.n)})
-      statements.update({('accept_prepare', v, p2)})
+    state.seen_p |= {p, p2}
     # — {commit b2 ∣ c.n ≠ 0 ∧ c ≲ b2 ≲h} (a vote to commit c,…,ℎ if c ≠ 0)
-    if c_n != 0: statements.update({('commit', v, Ballot(n=b2, x=b.x)) for b2 in range(c_n, h_n+1)})
 
-    state.votes.update(statements)
+    if state.phi in ('PREPARE', 'CONFIRM'):
+      update_state(state)
+      send_message(state)
 
-    update_state(i) ## update state based on new statements
+  def receive(msg=('CONFIRM', v, i, (b, p_n, c_n, h_n), D)):
+    if self.crashed: return
+    state = self.state_per_slot.setdefault(i, State(i, self.D)) ## retrieve or initialize the state for mentioned slot
 
-    ## received a message from v with a vote to prepare b,
-    ## a vote to confirm p and p2 are prepared which means that v is claiming to accept p and p2
-    ## a vote to commit c,...,h if c != 0, which means that v is claiming to accept c,...,h are prepared
-    
-  def receive(msg=('CONFIRM', v, i, b, p_n, c_n, h_n, D)):
-    state = self.state_per_slot.setdefault(i) ## retrieve the state for mentioned slot
-    statements = set()
+    if not state.add_message(('CONFIRM', v, i, (b, p_n, c_n, h_n), D)): return ## Ignore if this is not a new message
 
     # Encodes:
     # — Everything implied by PREPARE v i ⟨infinity,b.x⟩ p 0 c.n infinity D
-    statements.update({('abort', v, b2) for b2 in setof(ballot, ('accept_abort', _, ballot) in state.votes, ballot.x != b.x)})
-    if p_n != 0: statements.update({('accept_abort', v, Ballot(n=b2, x=b.x)) for b2 in range(0, p_n)})
-    if c_n != 0:
-      statements.update({('commit', v, Ballot(n=b2, x=b.x)) for b2 in range(c_n, h_n+1)})
-      statements.update({('commit', v, Ballot(n=INFINITY, x=b.x))}) ## add a single infinity record to represent all commits upto inifinity
+    state.seen_b.add(Ballot(INFINITY, b.x))
+    state.seen_p.add(Ballot(p_n, b.x))
     # — {accept(commit b2 ) ∣ c ≲ b2 ≲h} (a vote to confirm commit c,…, h)
-    statements.update({('accept_commit', v, Ballot(n=b2, x=b.x)) for b2 in range(c_n, h_n+1)})
-    state.votes.update(statements)
 
-    update_state(i) ## update state based on new statements
+    if state.phi in ('PREPARE', 'CONFIRM'):
+      update_state(state)
+      send_message(state)
 
-  ### def receive(msg=('EXTERNALIZE', v, i, x, c_n, h_n, D)):
-  ###   state = self.state_per_slot.setdefault(i) ## retrieve the state for mentioned slot
-  ###   statements = set()
-  ###   # Encodes:
-  ###   # — Everything implied by CONFIRM v i ⟨infinity, x⟩ infinity c.n infinity D
-  ###   # — Everything implied by CONFIRM v i ⟨infinity, x⟩ infinity c.n h.n {{v}}
+  def receive(msg=('EXTERNALIZE', v, i, (x, c_n, h_n), D)):
+    if self.crashed: return
+    state = self.state_per_slot.setdefault(i, State(i, self.D)) ## retrieve or initialize the state for mentioned slot
 
-  ## for (1) where m lets v accept new ballots - just count commits that don't clash with aborts. a quorum of commits 
-  ## or vblocking of accept_commits (from confirm) would do 
-  # def accept_prepare(state, b):
-  #   ## TODO: avoid clash with aborts here, also add own votes signifying accepting prepare?
-  #   if qc.v_blocking(setof(str(v), ('commit', v, _b) in state.votes)) or qc.quorum(setof(str(v), (vote, v, _b) in state.votes, vote in {'accept_commit', 'commit'})):
-  #     if b.gt_nc(state.p):
-  #       state.p2 = state.p
-  #       state.p = b
-  #     elif b.gt_c(state.p):
-  #       state.p = b
-  #     elif b > state.p2: state.p2 = b
-  #
-  # def update_state(state, b, p, p2=Ballot(0, None)):
-  #   ## first figure out own votes, at least which aborts self is accepting, to figure out which commits self can accept
-  #
-  #
-  #   if state.phi == 'PREPARE':
-  #     [accept_prepare(state, b2) for b2 in (b, p, p2)]
-  #
+    if not state.add_message(('EXTERNALIZE', v, i, (x, c_n, h_n), D)): return ## Ignore if this is not a new message
 
+    # Encodes:
+    # — Everything implied by CONFIRM v i ⟨infinity, x⟩ infinity c.n infinity D
+    # — Everything implied by CONFIRM v i ⟨infinity, x⟩ infinity c.n h.n {{v}}
+    state.seen_b.add(Ballot(INFINITY, x))
+    state.seen_p.add(Ballot(INFINITY, x))
 
-  def update_state(i:int):
-    state = self.state_per_slot.setdefault(i) ## retrieve the state for mentioned slot
+    if state.phi in ('PREPARE', 'CONFIRM'):
+      update_state(state)
+      send_message(state)
 
+  def update_state(state):
     if state.phi == 'PREPARE':
       # (1) If phi = PREPARE and m lets v accept new ballots as prepared, update p and p2.
+      ## find all ballots that could be accepted prepared due to this message
+      ## ballots <= and ~ b and > own p2.n and not lt_c(own p) check if any are accepted?
+      if some(ballot in state.seen_b | state.seen_p, has=ballot.n > state.p2.n and not ballot.lt_c(state.p) and accepts_prepare(state, ballot)):
+        ## p2 and p are the 2 highest ballots accepted as prepared such that p2.lt_nc(p)
+        if ballot.gt_nc(state.p):
+          state.p2 = state.p
+          state.p = ballot
+        elif ballot.gt_c(state.p):
+          state.p = ballot
+        elif ballot > state.p2: state.p2 = ballot
+
       # Afterwards, if either p ⋧ h or p2 ⋧ h, then set c to 0
-
-      # Definition (accept). An FBAS node v accepts a statement a iff it has never accepted
-      # a statement contradicting a and it determines that either
-      # (1) There exists a quorum U such that v ∈ U and each member of U either voted for
-      # a or claims to accept a, or
-      # (2) Each member of a v-blocking set claims to accept a.
-
-      # Definition (prepared). A ballot b is prepared iff every statement in the following set
-      # is true: { abort b_old ∣ b_old ⋦ b }
-
-      ## highest b for which we have either a quorum of abort votes or a v-blocking set of abort votes for all b_old ⋦ b
-      abort_ballots = setof(b, (_, _, b) in state.votes,
-                            qc.check_threshold(qc.quorum_graph[qc.v], qc.quorum_graph,
-                                                {str(v) for v in setof(v, ('abort', v, _b) in state.votes)
-                                                                | setof(v, ('accept_abort', v, _b) in state.votes)},
-                                                blocking=False))
-      highest_aborted_ballot = max(abort_ballots) if abort_ballots else None
-      if highest_aborted_ballot is None: return #? continue federated voting as no ballot can be accepted prepared
-      ## find the smallest ballot higher than above ballot - this can be accepted as prepared
-      state.p2 = state.p
-      prepared_candidates = setof(b, (_, _, b) in state.votes, b.gt_nc(highest_aborted_ballot))
-      state.p = min(prepared_candidates) if prepared_candidates else state.p
-      if state.p.gt_nc(state.h) or state.p2.gt_nc(state.h):
-        state.c = Ballot()
-        output(f'for slot {i}, set c to 0 due to p or p2 being greater than and not compatible with h')
+      if state.p.gt_nc(state.h) or state.p2.gt_nc(state.h): state.c = Ballot()
 
       # (2) If phi = PREPARE and m lets v confirm new higher ballots prepared, then raise h
       # to the highest such ballot and set z to h.x.
-      if confirm_condition: #? what is m lets v confirm new higher ballots prepared? some condition on how many prepare messages v receives?
-        h_candidates = [message[7] for message in state.M.values() if message[0] == 'PREPARE' and message[7] > state.h.n]
-        if h_candidates:
-          state.h = Ballot(max(h_candidates), state.b.x)
-          state.z = state.h.x
-          output(f'for slot {i}, raised h to {state.h} and set z to h.x: {state.z}')
+      confirm_candidates = setof(ballot, ballot in state.seen_b | state.seen_p,
+                          ballot > state.h,
+                          qc.quorum(accepted_prepare(state, ballot)))
+
+      if confirm_candidates:
+        state.h = max(confirm_candidates)
+        state.z = state.h.x
 
       # (3) If phi = PREPARE, c = 0, b ≤ h, and neither p ⋧ h nor p2 ⋧ h, then set c to the lowest
       # ballot satisfying b ≤ c ≲ h.
-      if state.c.n == 0 and state.b <= state.h and not state.p.gt_nc(state.h) and not state.p2.gt_nc(state.h):
-        state.c = Ballot(n=state.b.n, x=state.b.x)
+      if state.c.n == 0 and state.b <= state.h and not(state.p.gt_nc(state.h) or state.p2.gt_nc(state.h)):
+        c = Ballot(state.b.n, state.h.x)
+        state.c = c if c >= state.b else Ballot(state.b.n + 1, state.h.x)
 
       # (4) If phi = PREPARE and v accepts commit for one or more ballots, set c to the lowest
       # such ballot, then set h to the highest ballot such that v accepts all { commit b2 ∣
       # c ≲ b2 ≲ h }, and set phi to CONFIRM. Also set z to h.x after updating h, and unless
       # h ≲ b, set b to h.
-      #? what is v accepts commit for one or more ballots? some condition on how many commit messages v receives?
+      points = commit_points_all(state)
+      accepted = setof(ballot, ballot in points, accepts_commit(state, ballot))
+      if accepted:
+        state.c = min(accepted)
+        state.h = max(setof(h, h in accepted, state.c.lt_c(h), accepts_commit_range(accepted, points, state.c, h)))
+        state.z = state.h.x
+        state.phi = 'CONFIRM'
+        if not state.h.lt_c(state.b): state.b = state.h
 
-
+    # (5) If phi = CONFIRM and the received message lets v accept new ballots prepared,
+    # raise p to the highest accepted prepared ballot such that p ∼ c.
     if state.phi == 'CONFIRM':
-      # (5) If phi = CONFIRM and the received message lets v accept new ballots prepared,
-      # raise p to the highest accepted prepared ballot such that p ∼ c.
-      if accept_condition(received(('CONFIRM', _, i, _, _, _, _, _))): #? what is m lets v accept new ballots prepared? some condition on how many confirm messages v receives?
-        #? ...
-        pass
+      p_candidates = setof(ballot, ballot in state.seen_b | state.seen_p, ballot.x == state.c.x, ballot > state.p, accepts_prepare(state, ballot))
+      if p_candidates: state.p = max(p_candidates)
 
       # (6) If phi = CONFIRM and v accepts more commit messages or raises b, then let h2 be
       # the highest ballot such that v accepts all { commit b2 ∣ b ≲ b2 ≲ h2 } (if any). If
       # there exists such an h2 and h2 > h, then set h to h2, and, if necessary, raise c to
       # the lowest ballot such that v accepts all { commit b2 ∣ c ≲ b2 ≲ h }.
-      #? what is v accepts more commit messages or raises b? some condition on how many commit messages v receives or if b is raised?
+      points = commit_points_all(state)
+      accepted = setof(ballot, ballot in points, accepts_commit(state, ballot))
+      h2_candidates = setof(h2, h2 in accepted, state.b.lt_c(h2), accepts_commit_range(accepted, points, state.b, h2))
+      if h2_candidates and max(h2_candidates) > state.h:
+        state.h = max(h2_candidates) #? we're changing h but not changing z with it.
+        lowest_c = minof(c2, c2 in accepted, c2.lt_c(state.h), accepts_commit_range(accepted, points, c2, state.h))
+        state.c = max(state.c, lowest_c)
 
       # (7) If phi = CONFIRM and v confirms commit c2 for any c2, set c and h to the lowest and
       # highest such ballots, set phi to EXTERNALIZE, externalize c.x, and terminate.
-      ## more notes : An SCP node cannot vote to confirm commit b until it has voted to confirm abort for all
-      ## lower-numbered incompatible ballots.
-      #? what is v confirms commit c2 for any c2? some condition on how many commit messages v receives?
-      pass
+      confirmed = setof(c2, c2 in points, qc.quorum(accepted_commit(state, c2)))
+      if confirmed:
+        state.c, state.h = min(confirmed), max(confirmed)
+        state.phi = 'EXTERNALIZE'
+        log(f'{self} externalized {state.c.x} for slot {state.slot} with c={state.c} h={state.h}')
 
     # (8) If phi ∈ {PREPARE, CONFIRM} and b < h, then set b to h.
-    if state.phi in ('PREPARE', 'CONFIRM') and state.b < state.h:
-      state.b = state.h
-      output(f'for slot {i}, updated b to h: {state.b}')
+    if state.phi in ('PREPARE', 'CONFIRM'):
+      if state.b < state.h: state.b = state.h
 
-    # (9) If phi ∈ {PREPARE, CONFIRM} and ∃S ⊆ Mv such that the set of senders { vm2 ∣
-    # m2 ∈ S } is v-blocking and ∀m2 ∈ S, b_m2.n > b_v.n, then set b to ⟨n, z⟩, where n is
-    # the lowest counter for which no such S exists. Repeat the previous steps after
-    # updating b
-    #? v-blocking condition?
+      # (9) If phi ∈ {PREPARE, CONFIRM} and ∃S ⊆ Mv such that the set of senders { vm2 ∣
+      # m2 ∈ S } is v-blocking and ∀m2 ∈ S, b_m2.n > b_v.n, then set b to ⟨n, z⟩, where n is
+      # the lowest counter for which no such S exists. Repeat the previous steps after
+      # updating b
+      ## such an S exists iff all senders ahead of the counter are v-blocking
+      sender_counters = setof((str(vm), INFINITY if t == 'EXTERNALIZE' else f[0].n), (t, vm, _, f, _) in state.M)
+      if qc.v_blocking(setof(vm, (vm, bn) in sender_counters, bn > state.b.n)):
+        n = minof(n2, (_, n2) in sender_counters, not qc.v_blocking(setof(vm, (vm, bn) in sender_counters, bn > n2)))
+        state.b = Ballot(n, state.z)
+        update_state(state)
+  
+  ## In section 6.2.2 in the paper
+  # For this reason, nodes employ a timer as follows:
+  def await_externalize(state:State):
+    # (a) A node v with phi_v ≠ EXTERNALIZE arms a timer whenever ∃S ⊆ M_v such that
+    # the set of senders U = { v_m ∣ m ∈ S } is a quorum, v ∈ U, and ∀m ∈ S, b_m.n ≥ b_v.n.
+    while True:
+      if await(state.phi == 'EXTERNALIZE'):
+        break
+      elif await(str(self) in setof(str(vm), (t, vm, _, f, _) in state.M, (INFINITY if t == 'EXTERNALIZE' else f[0].n) >= state.b.n)
+                 and qc.quorum(setof(str(vm), (t, vm, _, f, _) in state.M, (INFINITY if t == 'EXTERNALIZE' else f[0].n) >= state.b.n))):
+        n = state.b.n
+        timer_armed(state)
+        if await(state.phi == 'EXTERNALIZE' or state.b.n != n):
+          continue
+        elif timeout(TIMEOUT * n):
+          increment_ballot(state)
+
+  def timer_armed(state:State):
+    log(f'{self} armed ballot timer at b={state.b} for slot {state.slot}')
+
+  def increment_ballot(state:State):
+    # (b) If the timer fires, v updates its ballot by setting b_v ← ⟨b_v.n + 1, z_v⟩.
+    state.b = Ballot(state.b.n + 1, state.z)
+    update_state(state)
+    send_message(state)
 
   def fbas_add(state, node, typ='vote', stmt=None):
     if stmt is None: return
@@ -445,7 +507,7 @@ def main():
       for s in config['slices']
     )
     D = (config['threshold'], inner_slices)
-    setup(nodes[node], [D, node, debug_names, log_file]) ## assuming that nodes start out only knowing the nodes in their quorum config and know no other nodes
+    setup(nodes[node], [D, set(all_nodes), node, debug_names, log_file])
 
   start(nodes.values())
   start(clients)

@@ -4,10 +4,10 @@ archive_logs() ## runs once, when this module is first imported, before any node
 archive_logs('test_logs')
 
 class Node(process):
-  def setup(name, debugNames, log_file, logs_dir='logs'):
+  def setup(peers, name, debugNames, log_file, logs_dir='logs', crashed=False):
     self.name = name
     self.debug_names = debugNames  ## maps str(node id) -> node name, so output() can de-anonymize ids in log lines
-    self.peers = {}
+    self.peers = dict.fromkeys(peers)
     self.gossip_known = {}
     self.protocol_messages = set()  ## subclasses override this to the set of message types that should be gossip-tracked
     output(f'Node {self} initialized')
@@ -19,6 +19,7 @@ class Node(process):
     if s: log_to_file(self.log_file, s, self.debug_names, self.logs_dir)
 
   def send(msg, to, debugOnly=False, withLog=None):
+    if self.crashed: return
     if msg[0] in self.protocol_messages:
       to = to - self.gossip_known.setdefault(hash_msg(msg), set())
       self.gossip_known[hash_msg(msg)] |= to
@@ -29,6 +30,7 @@ class Node(process):
       super().send(msg, to=to)
 
   def receive(msg=m):
+    if self.crashed: return
     output(f'received a message: {m}')
     if m[0] in self.protocol_messages:
       h = hash_msg(m)

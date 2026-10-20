@@ -4,6 +4,21 @@ QUORUM_CONFIG = {
   'carol': {'threshold': 1, 'slices': [{'threshold': 2, 'validators': {'alice', 'bob', 'carol'}}]},
 }
 
+DEFAULT_QUORUM_CONFIG = {
+  'alice': {'threshold': 1, 'slices': [{'threshold': 3, 'validators': {'alice', 'bob', 'carol', 'dave'}}]},
+  'bob':   {'threshold': 1, 'slices': [{'threshold': 3, 'validators': {'alice', 'bob', 'carol', 'dave'}}]},
+  'carol': {'threshold': 1, 'slices': [{'threshold': 3, 'validators': {'alice', 'bob', 'carol', 'dave'}}]},
+  'dave':  {'threshold': 1, 'slices': [{'threshold': 3, 'validators': {'alice', 'bob', 'carol', 'dave'}}]},
+
+  'eve':   {'threshold': 1, 'slices': [{'threshold': 2, 'validators': {'alice', 'bob', 'carol', 'dave'}}]},
+  'frank': {'threshold': 1, 'slices': [{'threshold': 2, 'validators': {'alice', 'bob', 'carol', 'dave'}}]},
+  'grace': {'threshold': 1, 'slices': [{'threshold': 2, 'validators': {'alice', 'bob', 'carol', 'dave'}}]},
+  'heidi': {'threshold': 1, 'slices': [{'threshold': 2, 'validators': {'alice', 'bob', 'carol', 'dave'}}]},
+
+  'ivan':  {'threshold': 1, 'slices': [{'threshold': 2, 'validators': {'eve', 'frank', 'grace', 'heidi'}}]},
+  'judy':  {'threshold': 1, 'slices': [{'threshold': 2, 'validators': {'eve', 'frank', 'grace', 'heidi'}}]},
+}
+
 ## Both tiers reference the SAME full 8-node top-tier validator set (alice..heidi), just
 ## at different thresholds: alice/bob/carol/dave need 5-of-8, eve/frank/grace/heidi need
 ## 6-of-8. Since every node's D lists all 8 names, everyone is directly peered with
@@ -73,6 +88,8 @@ class NodeManager(process):
     self.debug_names = {}
     self.ready_nodes = set()
     self.done_nodes = set()
+    self.crashed_nodes = set()
+    self.node_Ds = {}
 
   def receive(msg=(tid, 'ready'), from_=source):
     self.ready_nodes.add(source)
@@ -82,12 +99,13 @@ class NodeManager(process):
 
   ## Spawn a fresh batch of `node_cls` processes for one test round, tagged with
   ## `test_id`. 
-  def spawn_nodes(quorum_config, node_cls, test_id, log_file):
+  def spawn_nodes(quorum_config, node_cls, test_id, log_file, crashed=(), node_args={}):
     self.ready_nodes = set()
     self.done_nodes = set()
     all_nodes = new(node_cls, num=len(quorum_config))
     self.nodes = dict(zip(quorum_config.keys(), all_nodes))
     self.debug_names = {str(pid): node_name for node_name, pid in nodes.items()}
+    self.crashed_nodes = setof(nodes[n], n in crashed)
     for node_name, config in quorum_config.items():
       ## Build D as a tuple: (outer_threshold, ((inner_threshold, validators), ...))
       inner_slices = tuple(
@@ -95,12 +113,18 @@ class NodeManager(process):
         for s in config['slices']
       )
       D = (config['threshold'], inner_slices)
-      setup(nodes[node_name], [D, self, node_name, debug_names, log_file, test_id])
+      self.node_Ds[nodes[node_name]] = D
+      setup(nodes[node_name], [D, set(all_nodes), self, node_name, debug_names, log_file, test_id, node_name in crashed, *node_args.get(node_name, ())])
     start(nodes.values())
-    await(len(self.ready_nodes) == len(quorum_config))
+    await(len(self.ready_nodes) == len(quorum_config) - len(crashed_nodes))
     output(f'spawned nodes for test {test_id}: {nodes}')
 
   def teardown_nodes():
     send(('terminate',), to=set(nodes.values()))
-    await(len(self.done_nodes) == len(nodes))
+    await(len(self.done_nodes) == len(nodes) - len(crashed_nodes))
     self.nodes = {}
+    self.crashed_nodes = set()
+    self.node_Ds = {}
+
+  def intact_nodes():
+    return setof(n, n in nodes.values(), n not in crashed_nodes)

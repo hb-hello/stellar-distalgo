@@ -38,6 +38,12 @@ class Ballot:
   def __gt__(self, other):
     return not self == other and not self < other
 
+  def __le__(self, other):
+    return self == other or self < other
+
+  def __ge__(self, other):
+    return self == other or self > other
+
   # Definition (compatible). Two ballots b1 and b2 are compatible, written b1 ∼ b2, iff
   # b1.x = b2.x and incompatible, written b1 ≁ b2, iff b1.x ≠ b2.x. We also write b1 ≲ b2 or
   # b2 ≳ b1 iff b1 ≤ b2 (or equivalently b2 ≥ b1) and b1 ∼ b2.
@@ -63,32 +69,26 @@ def extract_fields(msg):
 
     # Extract fields based on message type (default to 0 if not present)
     if msg_type == 'PREPARE':
-      # PREPARE v i b p p2 c.n h.n D
+      # PREPARE v i (b p p2 c.n h.n) D
       phi = phi_order['PREPARE']
-      b = msg[3] if len(msg) > 3 else Ballot(0, None)
-      p = msg[4] if len(msg) > 4 else Ballot(0, None)
-      p2 = msg[5] if len(msg) > 5 else Ballot(0, None)
-      h_n = msg[7] if len(msg) > 7 else 0
+      b, p, p2, _, h_n = msg[3]
       h = Ballot(h_n, b.x) if h_n != 0 else Ballot(0, None)
 
     elif msg_type == 'CONFIRM':
-      # CONFIRM v i b p.n c.n h.n D
+      # CONFIRM v i (b p.n c.n h.n) D
       phi = phi_order['CONFIRM']
-      b = msg[3] if len(msg) > 3 else Ballot(INFINITY, None)
-      p_n = msg[4] if len(msg) > 4 else 0
+      b, p_n, _, h_n = msg[3]
       p = Ballot(p_n, b.x) if p_n != 0 else Ballot(0, None)
       p2 = Ballot(0, None)  # p2 = 0 for CONFIRM
-      h_n = msg[6] if len(msg) > 6 else 0
-      h = Ballot(h_n, b.x) if h_n != 0 else Ballot(0, None)
+      h =Ballot(h_n, b.x) if h_n != 0 else Ballot(0, None)
 
     elif msg_type == 'EXTERNALIZE':
-      # EXTERNALIZE v i x c.n h.n D
+      # EXTERNALIZE v i (x c.n h.n) D
       phi = phi_order['EXTERNALIZE']
-      x = msg[3] if len(msg) > 3 else None
+      x, _, h_n = msg[3]
       b = Ballot(INFINITY, x)
       p = Ballot(INFINITY, x)
       p2 = Ballot(0, None)  # p2 = 0 for EXTERNALIZE
-      h_n = msg[5] if len(msg) > 5 else INFINITY
       h = Ballot(h_n, x)
     else:
       ## Unknown message type, return minimum values
@@ -131,8 +131,9 @@ class State:
 
     self.fbas = set() ## (node, vote-or-accept, statement) - stands in for VoteManager.stmts
     self.fbas_accepted = set() ## statements self has accepted
-    self.fbas_confirmed = set() ## stands in for VoteManager.confirmed
-
+    self.fbas_confirmed = set() ## stands self has confirmed
+    self.seen_b = set()
+    self.seen_p = set()
     # Each node initializes its slot state by setting phi to PREPARE, b to ⟨0, z⟩,
     # M to empty set, and all other fields (p, p2, c, h) to invalid ballot 0.
 
@@ -171,7 +172,7 @@ class State:
       self.M.add(msg)
       return True
     else:
-       if (phi, b, p, p2, h) < extract_fields(existing_msg):
+       if (phi, b, p, p2, h) > extract_fields(existing_msg):
          self.M.discard(existing_msg)
          self.M.add(msg)
          return True
