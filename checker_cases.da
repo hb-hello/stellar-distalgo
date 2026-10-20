@@ -1,0 +1,115 @@
+# type: ignore
+import sys
+from scp_checker import Checker
+
+BALLOTS = {'PREPARE', 'CONFIRM'}
+
+## quorum config is {name: (threshold, members)}, a member being a name or a nested (threshold, members)
+## each case is (name, quorum config, slots, crashed, slow {node: (seconds slept per message, slots, message types)}, timeout)
+
+_ABC = {'alice', 'bob', 'carol'}
+QUORUM_CONFIG = {
+  'alice': (2, _ABC),
+  'bob':   (2, _ABC),
+  'carol': (2, _ABC),
+}
+## sanity - every check True
+basic_3node = ('basic_3node', QUORUM_CONFIG, 3, set(), {}, 30)
+
+_TOP4 = {'alice', 'bob', 'carol', 'dave'}
+_MID4 = {'eve', 'frank', 'grace', 'heidi'}
+DEFAULT_QUORUM_CONFIG = {
+  'alice': (3, _TOP4),
+  'bob':   (3, _TOP4),
+  'carol': (3, _TOP4),
+  'dave':  (3, _TOP4),
+
+  'eve':   (2, _TOP4),
+  'frank': (2, _TOP4),
+  'grace': (2, _TOP4),
+  'heidi': (2, _TOP4),
+
+  'ivan':  (2, _MID4),
+  'judy':  (2, _MID4),
+}
+## validate_nomination, theorem_12, theorem_13 across a tiered config - every check True, all 10 externalize
+tiered_10node = ('tiered_10node', DEFAULT_QUORUM_CONFIG, 3, set(), {}, 30)
+
+## Both tiers reference the SAME full 8-node top-tier validator set (alice..heidi), just
+## at different thresholds: alice/bob/carol/dave need 5-of-8, eve/frank/grace/heidi need
+## 6-of-8.
+_TOP8 = _TOP4 | _MID4
+DISJOINT_LEADERS_CONFIG = {
+  'alice': (5, _TOP8),
+  'bob':   (5, _TOP8),
+  'carol': (5, _TOP8),
+  'dave':  (5, _TOP8),
+
+  'eve':   (6, _TOP8),
+  'frank': (6, _TOP8),
+  'grace': (6, _TOP8),
+  'heidi': (6, _TOP8),
+
+  'ivan':  (2, {'alice', 'bob', 'eve', 'frank'}),
+  'judy':  (2, {'carol', 'dave', 'grace', 'heidi'}),
+}
+## theorem_12 - nodes start from different max-priority leaders but still converge on one composite value
+disjoint_leaders = ('disjoint_leaders', DISJOINT_LEADERS_CONFIG, 3, set(), {}, 30)
+
+## 3 orgs of 3 nodes - a node needs 4 of: each node of its own org, 2 of 3 from each other org
+_ORGS3 = [{f'org{i}.n{j}' for j in range(3)} for i in range(3)]
+CLOSED_RING_3ORG_CONFIG = {v: (4, (*own, *((2, other) for other in _ORGS3 if other != own))) for own in _ORGS3 for v in own}
+## every check on a stellar-style org config (3 orgs of 3, 67% of orgs, 51% within an org) - every check True
+closed_ring_3org = ('closed_ring_3org', CLOSED_RING_3ORG_CONFIG, 2, set(), {}, 30)
+
+## 4 core orgs of 3 nodes and 4 peripheral orgs of 2 - a node needs 67% of: each node of its own org,
+## 2 from each org it depends on (core: 6 of 3 + 5, peripheral: 3 of 2 + 2)
+_ORGS8 = [{f'org{i}.n{j}' for j in range(3 if i < 4 else 2)} for i in range(8)]
+_DEPS8 = {0: [1, 2, 3, 4, 6], 1: [0, 2, 3, 4, 5], 2: [0, 1, 3, 6, 7], 3: [0, 1, 2, 5, 7],
+          4: [0, 1], 5: [1, 3], 6: [0, 2], 7: [2, 3]}
+BALANCED_8ORG_CONFIG = {v: (6 if i < 4 else 3, (*_ORGS8[i], *((2, _ORGS8[j]) for j in _DEPS8[i]))) for i in range(8) for v in _ORGS8[i]}
+
+## every check on a larger stellar-style config with core and peripheral orgs - every check True
+balanced_8org = ('balanced_8org', BALANCED_8ORG_CONFIG, 2, set(), {}, 60)
+
+## liveness with one crash - every check True, the 9 intact nodes externalize
+crash_one = ('crash_one', DEFAULT_QUORUM_CONFIG, 2, {'dave'}, {}, 30)
+
+## top tier can't form a quorum so no node is intact - every check vacuously True (0 externalized, 0 armed)
+crash_blocking = ('crash_blocking', DEFAULT_QUORUM_CONFIG, 1, {'alice', 'bob'}, {}, 10)
+
+## two groups that each only trust themselves - {alice, bob, carol} and {dave, eve, frank} are
+## disjoint quorums, so the FBAS lacks quorum intersection and the groups can externalize different values
+_DEF = {'dave', 'eve', 'frank'}
+DISJOINT_QUORUM_CONFIG = {n: (2, g) for g in (_ABC, _DEF) for n in g}
+## theorem_13/14 precondition - no quorum intersection so both inapplicable, theorem_12 False (groups pick different values)
+disjoint_quorum = ('disjoint_quorum', DISJOINT_QUORUM_CONFIG, 1, set(), {}, 10)
+
+## theorem_14 with counters climbing past 1 (alice crashed so bob/carol/dave are all needed, dave slowed) - eve keeps up: True
+t14_lagging_ok = ('t14_lagging_ok', DEFAULT_QUORUM_CONFIG, 1, {'alice'}, {'dave': (0.05, {1}, BALLOTS), 'eve': (0.01, {1}, BALLOTS)}, 30)
+
+## theorem_14 - same but eve lags behind the others' timers: False
+t14_lagging_bad = ('t14_lagging_bad', DEFAULT_QUORUM_CONFIG, 1, {'alice'}, {'dave': (0.05, {1}, BALLOTS), 'eve': (0.5, {1}, BALLOTS)}, 30)
+
+CASES = [basic_3node, tiered_10node, disjoint_leaders, closed_ring_3org, balanced_8org, crash_one, crash_blocking, disjoint_quorum, t14_lagging_ok, t14_lagging_bad]
+
+## python -m da checker_cases.da [case name ...] - runs every case when none are named
+def main():
+  config(channel is reliable, clock=lamport)
+  rows = []
+  for (name, quorum_config, slots, crashed, slow, case_timeout) in CASES:
+    if len(sys.argv) > 1 and name not in sys.argv[1:]: continue
+    checker = new(Checker, [name, quorum_config, slots, crashed, slow, case_timeout], num=1)
+    start(checker)
+    await(some(received(('results', _name, _, _, _))))
+    timed_out, intact, results = next(iter(setof((t, it, r), received(('results', _name, t, it, r)))))
+    end(checker)
+    output(f'=== {name}: {len(quorum_config)} nodes, {slots} slots, crashed={crashed}, slow={slow}, intact={list(intact)}'
+           + (f' - timed out after {case_timeout}s' if timed_out else ''))
+    for (i, checks, stats) in results:
+      output(f'{name} slot {i}: ' + ' '.join(f'{k}={v}' for k, v in checks) + ' | ' + ' '.join(f'{k}={v}' for k, v in stats))
+      rows.append((name, i, checks))
+  if not rows: return
+  output('=== summary: case slot | ' + ' '.join(k for k, _ in rows[0][2]))
+  for (name, i, checks) in rows:
+    output(f'{name:<18} {i} | ' + ' '.join(f'{v!s:<{len(k)}}' for k, v in checks))

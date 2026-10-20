@@ -173,6 +173,14 @@ def has_quorum_intersection(Q):
 def is_nested(m):
   return isinstance(m, tuple) and len(m) == 2
 
+## config is (threshold, members) over names - swaps each name for its node id
+def build_D(config, nodes):
+  t, members = config
+  return (t, frozenset(build_D(m, nodes) if is_nested(m) else nodes[m] for m in members))
+
+def validators(D):
+  return set().union(*(validators(m) if is_nested(m) else {m} for m in D[1]))
+
 def satisfied(D, S):
   t, members = D
   return sum(satisfied(m, S) if is_nested(m) else m in S for m in members) >= t

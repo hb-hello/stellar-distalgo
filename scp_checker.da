@@ -1,34 +1,10 @@
 # type: ignore
-import sys, time
+import time
 from datetime import datetime
 from scp import SCPNode, combine
 from client import Client
 import quorum
-from node_manager import NodeManager, QUORUM_CONFIG, DEFAULT_QUORUM_CONFIG, DISJOINT_LEADERS_CONFIG, CLOSED_RING_3ORG_CONFIG, DISJOINT_QUORUM_CONFIG
-
-BALLOTS = {'PREPARE', 'CONFIRM'}
-
-## (name, quorum_config, nslots, crashed, slow {node: (delay, slots, msg types)}, timeout)
-CASES = [
-  ## sanity - every check True
-  ('basic_3node', QUORUM_CONFIG, 3, set(), {}, 30),
-  ## validate_nomination, theorem_12, theorem_13 across a tiered config - every check True, all 10 externalize
-  ('tiered_10node', DEFAULT_QUORUM_CONFIG, 3, set(), {}, 30),
-  ## theorem_12 - nodes start from different max-priority leaders but still converge on one composite value
-  ('disjoint_leaders', DISJOINT_LEADERS_CONFIG, 3, set(), {}, 30),
-  ## every check on a stellar-style org config (3 orgs of 3, 67% of orgs, 51% within an org) - every check True
-  ('closed_ring_3org', CLOSED_RING_3ORG_CONFIG, 2, set(), {}, 30),
-  ## liveness with one crash - validate_nomination, theorem_12 True, the 9 intact nodes externalize
-  ('crash_one', DEFAULT_QUORUM_CONFIG, 2, {'dave'}, {}, 30),
-  ## liveness should fail - top tier can't form a quorum: validate_nomination False, theorem_13/14 vacuous (0 externalized, 0 armed)
-  ('crash_blocking', DEFAULT_QUORUM_CONFIG, 1, {'alice', 'bob'}, {}, 10),
-  ## theorem_13 precondition - no quorum intersection so theorem_13/14 inapplicable, groups externalize different values, theorem_12 False
-  ('disjoint_quorum', DISJOINT_QUORUM_CONFIG, 1, set(), {}, 10),
-  ## theorem_14 with counters climbing past 1 (alice crashed so bob/carol/dave are all needed, dave slowed) - eve keeps up: True
-  ('t14_lagging_ok', DEFAULT_QUORUM_CONFIG, 1, {'alice'}, {'dave': (0.05, {1}, BALLOTS), 'eve': (0.01, {1}, BALLOTS)}, 30),
-  ## theorem_14 - same but eve lags behind the others' timers: False
-  ('t14_lagging_bad', DEFAULT_QUORUM_CONFIG, 1, {'alice'}, {'dave': (0.05, {1}, BALLOTS), 'eve': (0.5, {1}, BALLOTS)}, 30),
-]
+from node_manager import NodeManager
 
 STATE_FIELDS = ('slot', 'n', 'X', 'Y', 'Z', 'phi', 'b', 'p', 'p2', 'c', 'h', 'z')
 
@@ -74,47 +50,43 @@ class SCPNodeC(process, SCPNode):
     send(('ready',), to={ checker })
     super().run()
 
+## runs one case and sends ('results', name, timed_out, intact names, per-slot (slot, checks, stats)) to its parent
 class Checker(process, Client, NodeManager):
-  def setup(name, cases):
+  def setup(name, quorum_config, nslots, crashed, slow, case_timeout):
     super().setup()
     self.name = name
     self.log_file = f'scp_log_{datetime.now().strftime("%Y%m%dT%H%M%S")}.txt'
-    self.test_id = 0
+    self.test_id = 1
     self.intact_set = set()
 
   def output(s):
     super().output(f'[{self.name}] {s}')
 
-
   def run():
-    summary = []
-    for (case, quorum_config, nslots, crashed, slow, case_timeout) in cases:
-      self.test_id += 1
-      slot_range = range(1, nslots + 1)
-      slow_until = time.time() + case_timeout
-      spawn_nodes(quorum_config, SCPNodeC, test_id, log_file, crashed, {n: (spec, slow_until) for n, spec in slow.items()})
-      # Definition (intact). A node v in an FBAS is intact iff there exists a DSet B containing
-      # all ill-behaved nodes and such that v ∉ B.
-      ## crashed nodes are the only ill-behaved nodes for now
-      self.intact_set = quorum.intact_set(self.node_Ds, self.crashed_nodes)
-      output(f'=== {case}: {len(quorum_config)} nodes, {int(nslots)} slots, crashed={crashed}, slow={slow}, intact={sorted(debug_names[str(v)] for v in self.intact_set)}')
-      send_all_different(slot_range, self.nodes)
-      if await(each(i in slot_range, has=validate_nomination(i) and theorem_12(i) and all_externalized(i))): pass
-      elif timeout(case_timeout): output(f'{case}: timed out after {case_timeout}s')
-      for i in slot_range:
-        results = (validate_nomination(i), theorem_12(i), theorem_13(i), theorem_14(i), theorem_15(i), theorem_16(i))
-        summary.append((case, i) + results)
-        armed = setof((v, n, t), received((_test_id, 'armed', _i, n, _, t), from_=v))
-        fired = setof((v, n, t), received((_test_id, 'fired', _i, n, _, t), from_=v))
-        output(f'{case} slot {i}: validate_nomination={results[0]} theorem_12={results[1]} '
-               f'theorem_13={results[2]} ({len(externalized(i))} externalized, {len(setof(x, (_, x) in externalized(i)))} distinct) '
-               f'theorem_14={results[3]} ({len(armed)} armed, {len(fired)} fired, max armed n {int(max(setof(n, (_, n, _) in armed) | {0}))}) '
-               f'theorem_15={results[4]} ({len(confirmed(i))} intact reached CONFIRM) theorem_16={results[5]}')
-      teardown_nodes()
-    output('=== summary: case slot | validate_nomination theorem_12 theorem_13 theorem_14 theorem_15 theorem_16')
-    for (case, i, vn, t12, t13, t14, t15, t16) in summary:
-      output(f'{case:<18} {i} | {vn!s:<5} {t12!s:<5} {t13!s:<5} {t14!s:<5} {t15!s:<5} {t16!s:<5}')
-    send(('done',), to=parent())
+    slot_range = range(1, nslots + 1)
+    slow_until = time.time() + case_timeout
+    spawn_nodes(quorum_config, SCPNodeC, test_id, log_file, crashed, {n: (spec, slow_until) for n, spec in slow.items()})
+    # Definition (intact). A node v in an FBAS is intact iff there exists a DSet B containing
+    # all ill-behaved nodes and such that v ∉ B.
+    ## crashed nodes are the only ill-behaved nodes for now
+    self.intact_set = quorum.intact_set(self.node_Ds, self.crashed_nodes)
+    send_all_different(slot_range, self.nodes)
+    timed_out = False
+    if await(each(i in slot_range, has=validate_nomination(i) and theorem_12(i) and all_externalized(i))): pass
+    elif timeout(case_timeout): timed_out = True
+    results = tuple(slot_results(i) for i in slot_range)
+    intact = tuple(sorted(debug_names[str(v)] for v in self.intact_set))
+    teardown_nodes()
+    send(('results', name, timed_out, intact, results), to=parent())
+
+  def slot_results(i):
+    armed = setof((v, n, t), received((_test_id, 'armed', _i, n, _, t), from_=v))
+    checks = (('validate_nomination', validate_nomination(i)), ('theorem_12', theorem_12(i)), ('theorem_13', theorem_13(i)),
+              ('theorem_14', theorem_14(i)), ('theorem_15', theorem_15(i)), ('theorem_16', theorem_16(i)))
+    stats = (('externalized', len(externalized(i))), ('distinct', len(setof(x, (_, x) in externalized(i)))),
+             ('armed', len(armed)), ('fired', len(setof(t, received((_test_id, 'fired', _i, _, _, t))))),
+             ('max_armed_n', int(max(setof(n, (_, n, _) in armed) | {0}))), ('confirm', len(confirmed(i))))
+    return (int(i), checks, stats)
 
   # Intact nodes can produce at least one candidate value for slot i.
   def validate_nomination(i):
@@ -122,6 +94,7 @@ class Checker(process, Client, NodeManager):
       some(received((_test_id, 'state', _i, _, s, _, _), from_=_n), has=s.Z))
 
   # Theorem 12. Eventually, all intact nodes will have the same composite value.
+  ## ?? paper's definition of intact nodes doesn't enforce quorum intersection...
   def theorem_12(i):
     return len(setof(combine(s.Z), n in self.intact_set,
       received((_test_id, 'state', _i, _, s, lc, _), from_=_n),
@@ -190,12 +163,3 @@ class Checker(process, Client, NodeManager):
   def externalized(i):
     return setof((n, s.c.x), n in self.nodes.values(),
       received((_test_id, 'state', _i, _, s, _, _), from_=_n), s.phi == 'EXTERNALIZE')
-
-## python -m da scp_checker.da [case name ...] - runs every case when none are named
-def main():
-  config(channel is reliable, clock=lamport)
-  cases = [c for c in CASES if len(sys.argv) < 2 or c[0] in sys.argv[1:]]
-  checker = new(Checker, ['checker', cases], num=1)
-  start(checker)
-  await(received(('done',)))
-  end(checker)

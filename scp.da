@@ -15,7 +15,6 @@ import hashlib
 from datetime import datetime
 from state import Ballot, State, INFINITY
 from node import Node
-from quorum_simple import QUORUM_CONFIG
 import quorum
 
 TIMEOUT = 1
@@ -67,7 +66,7 @@ class SCPNode(process, Node):
     self.state_per_slot = dict()  ## To maintain the state per slot #? should this be a set instead of dict?
     self.qc = quorum.QuorumChecker2(str(self), D) ## qc builds and owns its own quorum_graph
     ## map of peers (node ids and their quorum config) based on quorum slices
-    for node in setof(n, (_, v) in D[1], n in v):
+    for node in quorum.validators(D):
       self.peers[node] = None
     self.peers[self] = D
     self.timers = {} ## (slot, kind) -> (deadline, b.n when armed)
@@ -176,7 +175,7 @@ class SCPNode(process, Node):
     return setof(str(v), (v, Xm, Ym, _) in nominations(state), x in Xm or x in Ym)
 
   def accepted_nominate(state, x):
-    return setof(str(v), (v, _, Ym, _) in nominations(state), x in Ym)
+    return setof(str(v), (v, _, Ym, _) in nominations(state), _x in Ym)
 
   def accepts_nominate(state, x):
     return qc.quorum(voted_nominate(state, x)) or qc.v_blocking(accepted_nominate(state, x))
@@ -476,6 +475,22 @@ class Client(process):
     # send(('TRANSACTION', 1, 'F'), to={ nodes['frank'] })
 
 def main():
+  _TOP4 = {'alice', 'bob', 'carol', 'dave'}
+  _MID4 = {'eve', 'frank', 'grace', 'heidi'}
+  QUORUM_CONFIG = {
+    'alice': (3, _TOP4),
+    'bob':   (3, _TOP4),
+    'carol': (3, _TOP4),
+    'dave':  (3, _TOP4),
+
+    'eve':   (2, _TOP4),
+    'frank': (2, _TOP4),
+    'grace': (2, _TOP4),
+    'heidi': (2, _TOP4),
+
+    'ivan':  (2, _MID4),
+    'judy':  (2, _MID4),
+  }
 
   all_nodes = new(SCPNode, num=len(QUORUM_CONFIG))
   nodes = dict(zip(QUORUM_CONFIG.keys(), all_nodes))
@@ -485,13 +500,7 @@ def main():
   log_file = f'scp_log_{datetime.now().strftime("%Y%m%dT%H%M%S")}.txt' 
   output(f'created nodes: {nodes}')
   for node, config in QUORUM_CONFIG.items():
-    ## Build D as a tuple: (outer_threshold, ((inner_threshold, validators), ...))
-    inner_slices = tuple(
-      (s['threshold'], frozenset(nodes[name] for name in s['validators']))
-      for s in config['slices']
-    )
-    D = (config['threshold'], inner_slices)
-    setup(nodes[node], [D, set(all_nodes), node, debug_names, log_file])
+    setup(nodes[node], [quorum.build_D(config, nodes), set(all_nodes), node, debug_names, log_file])
 
   start(nodes.values())
   start(clients)

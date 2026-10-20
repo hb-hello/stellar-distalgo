@@ -1,90 +1,4 @@
-QUORUM_CONFIG = {
-  'alice': {'threshold': 1, 'slices': [{'threshold': 2, 'validators': {'alice', 'bob', 'carol'}}]},
-  'bob':   {'threshold': 1, 'slices': [{'threshold': 2, 'validators': {'alice', 'bob', 'carol'}}]},
-  'carol': {'threshold': 1, 'slices': [{'threshold': 2, 'validators': {'alice', 'bob', 'carol'}}]},
-}
-
-DEFAULT_QUORUM_CONFIG = {
-  'alice': {'threshold': 1, 'slices': [{'threshold': 3, 'validators': {'alice', 'bob', 'carol', 'dave'}}]},
-  'bob':   {'threshold': 1, 'slices': [{'threshold': 3, 'validators': {'alice', 'bob', 'carol', 'dave'}}]},
-  'carol': {'threshold': 1, 'slices': [{'threshold': 3, 'validators': {'alice', 'bob', 'carol', 'dave'}}]},
-  'dave':  {'threshold': 1, 'slices': [{'threshold': 3, 'validators': {'alice', 'bob', 'carol', 'dave'}}]},
-
-  'eve':   {'threshold': 1, 'slices': [{'threshold': 2, 'validators': {'alice', 'bob', 'carol', 'dave'}}]},
-  'frank': {'threshold': 1, 'slices': [{'threshold': 2, 'validators': {'alice', 'bob', 'carol', 'dave'}}]},
-  'grace': {'threshold': 1, 'slices': [{'threshold': 2, 'validators': {'alice', 'bob', 'carol', 'dave'}}]},
-  'heidi': {'threshold': 1, 'slices': [{'threshold': 2, 'validators': {'alice', 'bob', 'carol', 'dave'}}]},
-
-  'ivan':  {'threshold': 1, 'slices': [{'threshold': 2, 'validators': {'eve', 'frank', 'grace', 'heidi'}}]},
-  'judy':  {'threshold': 1, 'slices': [{'threshold': 2, 'validators': {'eve', 'frank', 'grace', 'heidi'}}]},
-}
-
-## two groups that each only trust themselves - {alice, bob, carol} and {dave, eve, frank} are
-## disjoint quorums, so the FBAS lacks quorum intersection and the groups can externalize different values
-_ABC, _DEF = {'alice', 'bob', 'carol'}, {'dave', 'eve', 'frank'}
-DISJOINT_QUORUM_CONFIG = {n: {'threshold': 1, 'slices': [{'threshold': 2, 'validators': g}]} for g in (_ABC, _DEF) for n in g}
-
-## Both tiers reference the SAME full 8-node top-tier validator set (alice..heidi), just
-## at different thresholds: alice/bob/carol/dave need 5-of-8, eve/frank/grace/heidi need
-## 6-of-8. Since every node's D lists all 8 names, everyone is directly peered with
-## everyone else (no gossip relay needed to cross tiers) - unlike an earlier version of
-## this config that made a separate node's independent vote mandatory via a nested AND
-## slice, which meant ratification (Y->Z) could never succeed because that node's own
-## nomination view rarely converged on the same value (nodes never got past X/Y - no
-## slot ever produced a candidate). Here, quorum intersection is via plain pigeonhole:
-## every valid quorum needs >=6-of-8 (5-of-8 alone is never enough once any 6-threshold
-## member is present, and there aren't enough non-top nodes to substitute), so any two
-## quorums share >=4 members - and because those members vote directly (not through an
-## uninvolved third party), the shared members' own accept_nominate votes are exactly
-## what's needed to ratify. The two thresholds (5 vs 6) still give alice/bob/carol/dave
-## and eve/frank/grace/heidi different weight() values off the same candidate pool, so
-## their locally-computed max-priority neighbor can still diverge round to round.
-_TOP8 = {'alice', 'bob', 'carol', 'dave', 'eve', 'frank', 'grace', 'heidi'}
-DISJOINT_LEADERS_CONFIG = {
-  'alice': {'threshold': 1, 'slices': [{'threshold': 5, 'validators': _TOP8}]},
-  'bob':   {'threshold': 1, 'slices': [{'threshold': 5, 'validators': _TOP8}]},
-  'carol': {'threshold': 1, 'slices': [{'threshold': 5, 'validators': _TOP8}]},
-  'dave':  {'threshold': 1, 'slices': [{'threshold': 5, 'validators': _TOP8}]},
-
-  'eve':   {'threshold': 1, 'slices': [{'threshold': 6, 'validators': _TOP8}]},
-  'frank': {'threshold': 1, 'slices': [{'threshold': 6, 'validators': _TOP8}]},
-  'grace': {'threshold': 1, 'slices': [{'threshold': 6, 'validators': _TOP8}]},
-  'heidi': {'threshold': 1, 'slices': [{'threshold': 6, 'validators': _TOP8}]},
-
-  'ivan':  {'threshold': 1, 'slices': [{'threshold': 2, 'validators': {'alice', 'bob', 'eve', 'frank'}}]},
-  'judy':  {'threshold': 1, 'slices': [{'threshold': 2, 'validators': {'carol', 'dave', 'grace', 'heidi'}}]},
-}
-
-def _round_up_pct(n, pct):
-  return 1 + ((n * pct - 1) // 100)
-
-def _org_names(org, size):
-  return [f'{org}.n{i}' for i in range(size)]
-
-def _org_config(own, deps):
-  slices = [{'threshold': 1, 'validators': {v}} for v in own] + \
-           [{'threshold': _round_up_pct(len(dep), 51), 'validators': set(dep)} for dep in deps]
-  return {'threshold': _round_up_pct(len(own) + len(deps), 67), 'slices': slices}
-
-def _orgs_config(orgs, deps_by_org):
-  config = {}
-  for i, deps in deps_by_org.items():
-    node_cfg = _org_config(orgs[i], [orgs[j] for j in deps])
-    for v in orgs[i]:
-      config[v] = node_cfg
-  return config
-
-_ALL4 = {'alice', 'bob', 'carol', 'dave'}
-BASIC_4NODE_CONFIG = {n: {'threshold': 1, 'slices': [{'threshold': 2, 'validators': _ALL4 - {n}}]} for n in _ALL4}
-
-_ORGS3 = {i: _org_names(f'org{i}', 3) for i in range(3)}
-CLOSED_RING_3ORG_CONFIG = _orgs_config(_ORGS3, {0: [1, 2], 1: [0, 2], 2: [0, 1]})
-
-_ORGS8 = {i: _org_names(f'org{i}', 3 if i < 4 else 2) for i in range(8)}
-BALANCED_8ORG_CONFIG = _orgs_config(_ORGS8, {
-  0: [1, 2, 3, 4, 6], 1: [0, 2, 3, 4, 5], 2: [0, 1, 3, 6, 7], 3: [0, 1, 2, 5, 7],
-  4: [0, 1], 5: [1, 3], 6: [0, 2], 7: [2, 3],
-})
+import quorum
 
 ## Owns the lifecycle of a test round's node processes 
 class NodeManager(process):
@@ -112,12 +26,7 @@ class NodeManager(process):
     self.debug_names = {str(pid): node_name for node_name, pid in nodes.items()}
     self.crashed_nodes = setof(nodes[n], n in crashed)
     for node_name, config in quorum_config.items():
-      ## Build D as a tuple: (outer_threshold, ((inner_threshold, validators), ...))
-      inner_slices = tuple(
-        (s['threshold'], frozenset(nodes[n] for n in s['validators']))
-        for s in config['slices']
-      )
-      D = (config['threshold'], inner_slices)
+      D = quorum.build_D(config, nodes)
       self.node_Ds[nodes[node_name]] = D
       setup(nodes[node_name], [D, set(all_nodes), self, node_name, debug_names, log_file, test_id, node_name in crashed, *node_args.get(node_name, ())])
     start(nodes.values())
