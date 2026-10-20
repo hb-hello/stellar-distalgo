@@ -19,6 +19,11 @@ DEFAULT_QUORUM_CONFIG = {
   'judy':  {'threshold': 1, 'slices': [{'threshold': 2, 'validators': {'eve', 'frank', 'grace', 'heidi'}}]},
 }
 
+## two groups that each only trust themselves - {alice, bob, carol} and {dave, eve, frank} are
+## disjoint quorums, so the FBAS lacks quorum intersection and the groups can externalize different values
+_ABC, _DEF = {'alice', 'bob', 'carol'}, {'dave', 'eve', 'frank'}
+DISJOINT_QUORUM_CONFIG = {n: {'threshold': 1, 'slices': [{'threshold': 2, 'validators': g}]} for g in (_ABC, _DEF) for n in g}
+
 ## Both tiers reference the SAME full 8-node top-tier validator set (alice..heidi), just
 ## at different thresholds: alice/bob/carol/dave need 5-of-8, eve/frank/grace/heidi need
 ## 6-of-8. Since every node's D lists all 8 names, everyone is directly peered with
@@ -125,6 +130,3 @@ class NodeManager(process):
     self.nodes = {}
     self.crashed_nodes = set()
     self.node_Ds = {}
-
-  def intact_nodes():
-    return setof(n, n in nodes.values(), n not in crashed_nodes)

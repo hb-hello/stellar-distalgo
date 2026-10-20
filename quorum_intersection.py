@@ -1,19 +1,16 @@
 # type: ignore
 
 from ortools.sat.python import cp_model
-from quorum import build_group
 
 
 ## Checks whether an FBAS enjoys quorum intersection by searching for a counterexample:
 ## two disjoint, nonempty quorums. UNSAT means every pair of quorums intersects.
-## Takes {v: D} and builds the same quorum_graph shape as QuorumChecker2 (quorum.py): node -> top
-## group id, group id -> (threshold, children), discriminated by the 'grp:' prefix.
+## Takes the same quorum_graph shape as QuorumChecker2 (quorum.da): node -> top group id,
+## group id -> (threshold, children), discriminated by the 'grp:' prefix.
 class QuorumIntersectionChecker:
-  def __init__(self, Q: dict):
-    self.quorum_graph = {}
-    for v, D in Q.items():
-      self.quorum_graph[str(v)] = build_group(self.quorum_graph, D)
-    self.validators = sorted(self._all_leaves(self.quorum_graph))
+  def __init__(self, quorum_graph: dict):
+    self.quorum_graph = quorum_graph
+    self.validators = sorted(self._all_leaves(quorum_graph))
 
   ## every leaf ever mentioned, whether it has its own D (a quorum_graph key) or is only
   ## referenced as a child inside some other node's group - e.g. an absent/"ghost" validator
@@ -79,32 +76,3 @@ class QuorumIntersectionChecker:
 
   def has_quorum_intersection(self) -> bool:
     return self.find_counterexample() is None
-
-
-if __name__ == "__main__":
-  ## safe: A and B share a 2-of-3 majority requirement over the SAME core {A,B,C} - any two
-  ## majority subsets of a 3-set must overlap, so intersection holds by construction
-  safe = QuorumIntersectionChecker(
-    {
-      "A": (2, {"A", "B", "C"}),
-      "B": (2, {"A", "B", "C"}),
-      "C": (2, {"A", "B", "C"}),
-    }
-  )
-  print("safe graph has_quorum_intersection:", safe.has_quorum_intersection())
-
-  ## unsafe: A and B's D's both reference X, but each can route around it via Y/Z instead -
-  ## {A,Y} and {B,Z} are disjoint quorums (see conversation for the worked argument)
-  unsafe = QuorumIntersectionChecker(
-    {
-      "A": (2, {"A", "X", "Y"}),
-      "B": (2, {"B", "X", "Z"}),
-      "X": (1, {"X"}),
-      "Y": (1, {"Y"}),
-      "Z": (1, {"Z"}),
-    }
-  )
-  print(
-    "unsafe graph has_quorum_intersection:", unsafe.has_quorum_intersection()
-  )
-  print("counterexample:", unsafe.find_counterexample())

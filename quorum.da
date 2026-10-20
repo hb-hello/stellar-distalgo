@@ -1,4 +1,7 @@
+# type: ignore
+from itertools import combinations
 import hashlib
+from quorum_intersection import QuorumIntersectionChecker
 
 ## quorum_graph holds two kinds of entries: node -> its top group id, and
 ## group id -> (threshold, children). Group ids are content-addressed
@@ -156,3 +159,54 @@ class QuorumChecker2:
       result = count >= effective_threshold
     memo[vertex] = result
     return result
+
+
+def quorum_graph(Q):
+  graph = {}
+  for v, D in Q.items():
+    graph[str(v)] = build_group(graph, D)
+  return graph
+
+def has_quorum_intersection(Q):
+  return QuorumIntersectionChecker(quorum_graph(Q)).has_quorum_intersection()
+
+def is_nested(m):
+  return isinstance(m, tuple) and len(m) == 2
+
+def satisfied(D, S):
+  t, members = D
+  return sum(satisfied(m, S) if is_nested(m) else m in S for m in members) >= t
+
+## ⟨V,Q⟩^B for one node: B's members count as already satisfied
+def delete(D, B):
+  t, members = D
+  kept = []
+  for m in members:
+    if is_nested(m): m = delete(m, B)
+    if (is_nested(m) and m[0] <= 0) or (not is_nested(m) and m in B): t -= 1
+    else: kept.append(m)
+  return (max(t, 0), tuple(kept))
+
+# Definition (DSet). Let ⟨V, Q⟩ be an FBAS and B ⊆ V be a set of nodes. We say B is
+# dispensible, or a DSet, iff:
+# (1) (quorum intersection despite B) ⟨V, Q⟩^B enjoys quorum intersection, and
+# (2) (quorum availability despite B) Either V ⧵ B ∈ 𝐐 or B = V.
+def is_dset(Ds, B):
+  rest = set(Ds) - B
+  return not rest or (all(satisfied(Ds[v], rest) for v in rest)
+    and has_quorum_intersection({v: delete(Ds[v], B) for v in rest}))
+
+# Definition (intact). A node v in an FBAS is intact iff there exists a DSet B containing
+# all ill-behaved nodes and such that v ∉ B.
+## every DSet containing ill contains the nodes left without a slice once ill is removed (repeatedly),
+## so if that set is itself a DSet it's the minimal one; otherwise search its supersets
+def intact_set(Ds, ill):
+  B = set(ill)
+  while True:
+    drop = set(v for v in set(Ds) - B if not satisfied(Ds[v], set(Ds) - B))
+    if not drop: break
+    B |= drop
+  if is_dset(Ds, B): return set(Ds) - B
+  rest = list(set(Ds) - B)
+  dsets = [B | set(c) for k in range(1, len(rest) + 1) for c in combinations(rest, k) if is_dset(Ds, B | set(c))]
+  return set(Ds) - set.intersection(*dsets)

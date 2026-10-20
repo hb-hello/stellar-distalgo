@@ -122,17 +122,14 @@ class SCPNode(process, Node):
     if state.v_n == self:
       state.X |= setof(x, received(('TRANSACTION', state.slot, x))) ## adding new values to vote for nominations
     else:
-      state.X |= setof(x, (state.v_n, 'vote', ('nominate', x)) in state.fbas) ## echoing current leader's nominate votes
+      state.X |= setof(x, (v, Xm, _, _) in state.N, v == state.v_n, x in Xm) ## echoing current leader's nominate votes
 
-    for x in state.X:
-      self.fbas_add(state, self, stmt=('nominate', x))
-
-    state.Y |= setof(x, ('nominate', x) in state.fbas_accepted)
+    state.Y |= setof(x, (_, Xm, Ym, _) in nominations(state), x in Xm | Ym, accepts_nominate(state, x))
     
     # A node v considers a value x to be a candidate when v has
     # confirmed the statement nominate x—i.e., v has ratified accept (nominate x).
     # move values from Y to Z based on candidate criteria
-    state.Z |= setof(x, ('nominate', x) in state.fbas_confirmed)
+    state.Z |= setof(x, x in state.Y, confirms_nominate(state, x))
 
     # Because nodes cannot tell when the nomination protocol is complete anyway, SCP
     # must cope with different composite values at different nodes. As an optimization, then,
@@ -164,18 +161,28 @@ class SCPNode(process, Node):
     ## Ignore if this is not a new nomination message
     if not state.add_nomination(sender, X, Y, D): return
 
-    # This concrete message encodes the following conceptual messages:
-    # — { nominate x ∣ x ∈ X } (votes to nominate each value in X)
-    for x in X:
-      self.fbas_add(state, sender, stmt=('nominate', x))
-    # — { accept (nominate x) ∣ x ∈ Y } (votes to confirm nominations in Y)
-    for y in Y:
-      self.fbas_add(state, sender, typ='accept', stmt=('nominate', y))
-
     #c nodes broadcast their state whenever there is an update in state
     if update_nomination_state(state):
       send_nomination(state)
     if is_new_slot: arm_timer(state, 'nomination', TIMEOUT)
+
+  def nominations(state):
+    return state.N | {(self, frozenset(state.X), frozenset(state.Y), self.D)}
+
+  def voted_nominate(state, x):
+    # This concrete message encodes the following conceptual messages:
+    # — { nominate x ∣ x ∈ X } (votes to nominate each value in X)
+    # — { accept (nominate x) ∣ x ∈ Y } (votes to confirm nominations in Y)
+    return setof(str(v), (v, Xm, Ym, _) in nominations(state), x in Xm or x in Ym)
+
+  def accepted_nominate(state, x):
+    return setof(str(v), (v, _, Ym, _) in nominations(state), x in Ym)
+
+  def accepts_nominate(state, x):
+    return qc.quorum(voted_nominate(state, x)) or qc.v_blocking(accepted_nominate(state, x))
+
+  def confirms_nominate(state, x):
+    return qc.quorum(accepted_nominate(state, x))
 
   # Fig. 17. Messages in SCP’s ballot protocol
 
@@ -282,6 +289,11 @@ class SCPNode(process, Node):
       | setof(Ballot(n, xm), ('EXTERNALIZE', _, _, f, _) in state.M, (xm, c_nm, _) in {f}, n in {c_nm, INFINITY}))
     return points | setof(Ballot(q.n + 1, b.x), b in points, q in {state.p, state.p2}, q.n != 0, q.n < INFINITY)
 
+  def prepare_points(state):
+    return (setof(q, ('PREPARE', _, _, f, _) in state.M, (bm, pm, p2m, _, _) in {f}, q in {bm, pm, p2m})
+      | setof(q, ('CONFIRM', _, _, f, _) in state.M, (bm, p_nm, _, _) in {f}, q in {Ballot(INFINITY, bm.x), Ballot(p_nm, bm.x)})
+      | setof(Ballot(INFINITY, xm), ('EXTERNALIZE', _, _, f, _) in state.M, (xm, _, _) in {f}))
+
   ## every counter up to one past the highest finite counter in play, plus INFINITY - nothing changes in between
   def commit_points_all(state):
     values = setof(f[0] if t == 'EXTERNALIZE' else f[0].x, (t, _, _, f, _) in state.M)
@@ -299,10 +311,8 @@ class SCPNode(process, Node):
 
     # This concrete message encodes a host of conceptual statements, as follows:
     # — {abort b2 ∨ accept(abort b2 ) ∣ b2 ⋦ b} (a vote to prepare b)
-    state.seen_b.add(b)
     # — {accept(abort b2 ) ∣ b2 ⋦ p} (a vote to confirm p is prepared)
     # — {accept(abort b2 ) ∣ b2 ⋦ p2 } (a vote to confirm p2 is prepared)
-    state.seen_p |= {p, p2}
     # — {commit b2 ∣ c.n ≠ 0 ∧ c ≲ b2 ≲h} (a vote to commit c,…,ℎ if c ≠ 0)
 
     if state.phi in ('PREPARE', 'CONFIRM'):
@@ -317,8 +327,6 @@ class SCPNode(process, Node):
 
     # Encodes:
     # — Everything implied by PREPARE v i ⟨infinity,b.x⟩ p 0 c.n infinity D
-    state.seen_b.add(Ballot(INFINITY, b.x))
-    state.seen_p.add(Ballot(p_n, b.x))
     # — {accept(commit b2 ) ∣ c ≲ b2 ≲h} (a vote to confirm commit c,…, h)
 
     if state.phi in ('PREPARE', 'CONFIRM'):
@@ -334,8 +342,6 @@ class SCPNode(process, Node):
     # Encodes:
     # — Everything implied by CONFIRM v i ⟨infinity, x⟩ infinity c.n infinity D
     # — Everything implied by CONFIRM v i ⟨infinity, x⟩ infinity c.n h.n {{v}}
-    state.seen_b.add(Ballot(INFINITY, x))
-    state.seen_p.add(Ballot(INFINITY, x))
 
     if state.phi in ('PREPARE', 'CONFIRM'):
       update_state(state)
@@ -346,7 +352,7 @@ class SCPNode(process, Node):
       # (1) If phi = PREPARE and m lets v accept new ballots as prepared, update p and p2.
       ## find all ballots that could be accepted prepared due to this message
       ## ballots <= and ~ b and > own p2.n and not lt_c(own p) check if any are accepted?
-      if some(ballot in state.seen_b | state.seen_p, has=ballot.n > state.p2.n and not ballot.lt_c(state.p) and accepts_prepare(state, ballot)):
+      if some(ballot in prepare_points(state), has=ballot.n > state.p2.n and not ballot.lt_c(state.p) and accepts_prepare(state, ballot)):
         ## p2 and p are the 2 highest ballots accepted as prepared such that p2.lt_nc(p)
         if ballot.gt_nc(state.p):
           state.p2 = state.p
@@ -360,7 +366,7 @@ class SCPNode(process, Node):
 
       # (2) If phi = PREPARE and m lets v confirm new higher ballots prepared, then raise h
       # to the highest such ballot and set z to h.x.
-      confirm_candidates = setof(ballot, ballot in state.seen_b | state.seen_p,
+      confirm_candidates = setof(ballot, ballot in prepare_points(state),
                           ballot > state.h,
                           qc.quorum(accepted_prepare(state, ballot)))
 
@@ -390,7 +396,7 @@ class SCPNode(process, Node):
     # (5) If phi = CONFIRM and the received message lets v accept new ballots prepared,
     # raise p to the highest accepted prepared ballot such that p ∼ c.
     if state.phi == 'CONFIRM':
-      p_candidates = setof(ballot, ballot in state.seen_b | state.seen_p, ballot.x == state.c.x, ballot > state.p, accepts_prepare(state, ballot))
+      p_candidates = setof(ballot, ballot in prepare_points(state), ballot.x == state.c.x, ballot > state.p, accepts_prepare(state, ballot))
       if p_candidates: state.p = max(p_candidates)
 
       # (6) If phi = CONFIRM and v accepts more commit messages or raises b, then let h2 be
@@ -441,28 +447,6 @@ class SCPNode(process, Node):
     state.b = Ballot(state.b.n + 1, state.z)
     update_state(state)
     send_message(state)
-
-  def fbas_add(state, node, typ='vote', stmt=None):
-    if stmt is None: return
-
-    state.fbas.add((node, typ, stmt))
-
-    if fbas_confirmed(state, stmt): return
-
-    voted = setof(str(n), (n, 'vote', _stmt) in state.fbas)
-    accepted = setof(str(n), (n, 'accept', _stmt) in state.fbas)
-    own_accept = (self, 'accept', stmt)
-    if not own_accept in accepted and (qc.quorum(voted | accepted) or qc.v_blocking(accepted)):
-      state.fbas.add((self, 'accept', stmt))
-      state.fbas_accepted.add(stmt)
-
-    if qc.quorum(accepted): state.fbas_confirmed.add(stmt)
-
-  def fbas_accepted(state, stmt):
-    return stmt in state.fbas_accepted
-
-  def fbas_confirmed(state, stmt):
-    return stmt in state.fbas_confirmed
 
   def run():
     while True:

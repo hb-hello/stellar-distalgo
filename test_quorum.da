@@ -1,5 +1,5 @@
-import unittest
-
+# type: ignore
+import sys, unittest
 import quorum
 from quorum_intersection import QuorumIntersectionChecker
 
@@ -16,6 +16,29 @@ def build_checker(v, node_specs):
 
 ## Cases adapted from stellar-core's examples/QuorumIntersectionTests.cpp
 class TestQuorumIntersection(unittest.TestCase):
+  ## A and B share a 2-of-3 majority requirement over the SAME core {A,B,C} - any two
+  ## majority subsets of a 3-set must overlap, so intersection holds by construction
+  def test_shared_majority_intersects(self):
+    self.assertTrue(quorum.has_quorum_intersection({
+      "A": (2, {"A", "B", "C"}),
+      "B": (2, {"A", "B", "C"}),
+      "C": (2, {"A", "B", "C"}),
+    }))
+
+  ## A and B's D's both reference X, but each can route around it via Y/Z instead -
+  ## {A,Y} and {B,Z} are disjoint quorums
+  def test_route_around_shared_node_disjoint(self):
+    specs = {
+      "A": (2, {"A", "X", "Y"}),
+      "B": (2, {"B", "X", "Z"}),
+      "X": (1, {"X"}),
+      "Y": (1, {"Y"}),
+      "Z": (1, {"Z"}),
+    }
+    self.assertFalse(quorum.has_quorum_intersection(specs))
+    U1, U2 = QuorumIntersectionChecker(quorum.quorum_graph(specs)).find_counterexample()
+    self.assertFalse(U1 & U2)
+
   def test_basic_4node_intersects(self):
     node_specs = {
       "A": (2, {"B", "C", "D"}),
@@ -25,7 +48,7 @@ class TestQuorumIntersection(unittest.TestCase):
     }
     qc = build_checker("A", node_specs)
     self.assertTrue(
-      QuorumIntersectionChecker(node_specs).has_quorum_intersection()
+      quorum.has_quorum_intersection(node_specs)
     )
     self.assertTrue(qc.quorum({"A", "B", "C"}))
     self.assertTrue(qc.v_blocking({"B", "C"}))
@@ -40,7 +63,7 @@ class TestQuorumIntersection(unittest.TestCase):
     }
     qc = build_checker("A", node_specs)
     self.assertFalse(
-      QuorumIntersectionChecker(node_specs).has_quorum_intersection()
+      quorum.has_quorum_intersection(node_specs)
     )
     self.assertTrue(qc.v_blocking({"B", "C", "D"}))
     self.assertFalse(qc.v_blocking({"B", "C"}))
@@ -57,7 +80,7 @@ class TestQuorumIntersection(unittest.TestCase):
     }
     qc = build_checker("A", node_specs)
     self.assertTrue(
-      QuorumIntersectionChecker(node_specs).has_quorum_intersection()
+      quorum.has_quorum_intersection(node_specs)
     )
     self.assertFalse(qc.quorum({"A", "B", "C", "D", "Ghost"}))
     ## Ghost can never be *in* a quorum, but it can still block one: threshold 3-of-3
@@ -96,7 +119,7 @@ class TestQuorumIntersection(unittest.TestCase):
     }
     qc = build_checker("A", node_specs)
     self.assertTrue(
-      QuorumIntersectionChecker(node_specs).has_quorum_intersection()
+      quorum.has_quorum_intersection(node_specs)
     )
     ## blocking a nested group: {B,D} blocks 2 of A's 3 inner sets (qsBDC, qsBDE),
     ## meeting A's own 2-of-3 blocking threshold
@@ -146,7 +169,7 @@ class TestQuorumIntersection(unittest.TestCase):
     }
     qc = build_checker("SDF1", node_specs)
     self.assertFalse(
-      QuorumIntersectionChecker(node_specs).has_quorum_intersection()
+      quorum.has_quorum_intersection(node_specs)
     )
 
   ## quorum intersection 8-org core-and-periphery dangling: "looks kinda strong" but still
@@ -208,9 +231,10 @@ class TestQuorumIntersection(unittest.TestCase):
 
     qc = build_checker("org0.n0", node_specs)
     self.assertFalse(
-      QuorumIntersectionChecker(node_specs).has_quorum_intersection()
+      quorum.has_quorum_intersection(node_specs)
     )
 
 
-if __name__ == "__main__":
-  unittest.main()
+def main():
+  result = unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromModule(sys.modules[__name__]))
+  output(f'{result.testsRun} tests, {len(result.failures)} failures, {len(result.errors)} errors')
