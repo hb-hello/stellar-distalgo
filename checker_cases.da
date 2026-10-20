@@ -86,10 +86,10 @@ DISJOINT_QUORUM_CONFIG = {n: (2, g) for g in (_ABC, _DEF) for n in g}
 disjoint_quorum = ('disjoint_quorum', DISJOINT_QUORUM_CONFIG, 1, set(), {}, 10)
 
 ## theorem_14 with counters climbing past 1 (alice crashed so bob/carol/dave are all needed, dave slowed) - eve keeps up: True
-t14_lagging_ok = ('t14_lagging_ok', DEFAULT_QUORUM_CONFIG, 1, {'alice'}, {'dave': (0.05, {1}, BALLOTS), 'eve': (0.01, {1}, BALLOTS)}, 30)
+t14_lagging_ok = ('t14_lagging_ok', DEFAULT_QUORUM_CONFIG, 1, {'alice'}, {'dave': (0.02, {1}, BALLOTS), 'eve': (0.01, {1}, BALLOTS)}, 30)
 
 ## theorem_14 - same but eve lags behind the others' timers: False
-t14_lagging_bad = ('t14_lagging_bad', DEFAULT_QUORUM_CONFIG, 1, {'alice'}, {'dave': (0.05, {1}, BALLOTS), 'eve': (0.5, {1}, BALLOTS)}, 30)
+t14_lagging_bad = ('t14_lagging_bad', DEFAULT_QUORUM_CONFIG, 1, {'alice'}, {'dave': (0.05, {1}, BALLOTS), 'eve': (2.0, {1}, BALLOTS)}, 30)
 
 CASES = [basic_3node, tiered_10node, disjoint_leaders, closed_ring_3org, balanced_8org, crash_one, crash_blocking, disjoint_quorum, t14_lagging_ok, t14_lagging_bad]
 

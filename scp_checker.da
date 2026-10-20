@@ -2,6 +2,7 @@
 import time
 from datetime import datetime
 from scp import SCPNode, combine
+from state import Ballot, INFINITY
 from client import Client
 import quorum
 from node_manager import NodeManager
@@ -81,24 +82,84 @@ class Checker(process, Client, NodeManager):
 
   def slot_results(i):
     armed = setof((v, n, t), received((_test_id, 'armed', _i, n, _, t), from_=v))
-    checks = (('validate_nomination', validate_nomination(i)), ('theorem_12', theorem_12(i)), ('theorem_13', theorem_13(i)),
-              ('theorem_14', theorem_14(i)), ('theorem_15', theorem_15(i)), ('theorem_16', theorem_16(i)))
+    qi = quorum_intersection(i)
+    if not qi: output(f'slot {i}: no quorum intersection, skipping theorem_4, theorem_8, theorem_9, theorem_11, theorem_13, theorem_14')
+    needs_qi = lambda check: check(i) if qi else 'skip'
+    checks = (('validate_nomination', validate_nomination(i)), ('vote_consistency', vote_consistency(i)),
+              ('theorem_4', needs_qi(theorem_4)), ('theorem_7', theorem_7()), ('theorem_8', needs_qi(theorem_8)), ('theorem_9', needs_qi(theorem_9)),
+              ('theorem_11', needs_qi(theorem_11)), ('theorem_12', theorem_12(i)), ('theorem_13', needs_qi(theorem_13)),
+              ('theorem_14', needs_qi(theorem_14)), ('theorem_15', theorem_15(i)), ('theorem_16', theorem_16(i)))
     stats = (('externalized', len(externalized(i))), ('distinct', len(setof(x, (_, x) in externalized(i)))),
              ('armed', len(armed)), ('fired', len(setof(t, received((_test_id, 'fired', _i, _, _, t))))),
              ('max_armed_n', int(max(setof(n, (_, n, _) in armed) | {0}))), ('confirm', len(confirmed(i))))
     return (int(i), checks, stats)
+
+  ## ⟨V, Q⟩ from theorem 13 - every config a node used during the slot, which is just node_Ds while configs are static
+  def quorum_intersection(i):
+    Qs = setof((n, m[-1]), n in self.nodes.values(),
+      received((_test_id, 'state', _i, m, _, _, _), from_=_n)) | set(self.node_Ds.items())
+    V_Q = {}
+    for v in setof(v, (v, _) in Qs):
+      Ds = setof(D, (_v, D) in Qs)
+      V_Q[v] = next(iter(Ds)) if len(Ds) == 1 else (1, frozenset(Ds))
+    return quorum.has_quorum_intersection(V_Q)
 
   # Intact nodes can produce at least one candidate value for slot i.
   def validate_nomination(i):
     return each(n in self.intact_set, has=
       some(received((_test_id, 'state', _i, _, s, _, _), from_=_n), has=s.Z))
 
+  def vote_consistency(i):
+    return each(n in self.nodes.values(), has=not some(b in ballots(i), has=
+      some(received((_test_id, 'state', _i, _, s, _, _), from_=_n), has=s.phi == 'PREPARE' and voted_commit(s, b))
+      and some(received((_test_id, 'state', _i, _, s2, _, _), from_=_n), has=voted_abort(s2, b))
+      and not some(received((_test_id, 'state', _i, _, s3, _, _), from_=_n), has=s3.p.gt_nc(b) or s3.p2.gt_nc(b))))
+
+  # THEOREM 4. Two contradictory statements a and ā cannot both be ratified in an
+  # FBAS that enjoys quorum intersection and contains no ill-behaved nodes.
+  ## commit b vs abort b; crashed nodes never vote, so this also covers theorems 5 and 6
+  def theorem_4(i):
+    return not some(b in ballots(i), has=
+      quorum.largest_quorum(self.node_Ds, voters(i, voted_commit, b)) and quorum.largest_quorum(self.node_Ds, voters(i, voted_abort, b)))
+
+  # THEOREM 7. Let B ⊆ V be a set of nodes in FBAS ⟨V, Q⟩. ⟨V, Q⟩ enjoys quorum
+  # availability despite B iff B is not v-blocking for any v ∈ V ⧵ B.
+  ## B = V ⧵ intact, which is v-blocking for v exactly when v has no slice inside intact
+  def theorem_7():
+    return each(v in self.intact_set, has=quorum.satisfied(self.node_Ds[v], self.intact_set))
+
+  # THEOREM 8. Two intact nodes in an FBAS that enjoys quorum intersection cannot
+  # accept contradictory statements.
+  ## nominate statements never contradict, so this is commit b (accepted for c ≲ b ≲ h once in CONFIRM)
+  ## vs abort b (accepted for every b ⋦ p, p2) - the lowest committed ballot c is the first to contradict
+  def theorem_8(i):
+    commits = setof(s.c, v in self.intact_set, received((_test_id, 'state', _i, _, s, _, _), from_=_v),
+      s.phi in ('CONFIRM', 'EXTERNALIZE'), s.c.n != 0)
+    prepared = setof(q, u in self.intact_set, received((_test_id, 'state', _i, _, s, _, _), from_=_u), q in {s.p, s.p2}, q.n != 0)
+    return not some(c in commits, q in prepared, has=q.gt_nc(c))
+
+  # THEOREM 9. Let ⟨V, Q⟩ be an FBAS enjoying quorum intersection despite B, and
+  # suppose B contains all ill-behaved nodes. Let v1 and v2 be two nodes not in B. Let a and
+  # ā be contradictory statements. If v1 confirms a, then v2 cannot confirm ā.
+  ## same as theorem 8 over confirmed statements - commit b confirmed for c ≲ b ≲ h once EXTERNALIZE,
+  ## h is the highest ballot confirmed prepared while in PREPARE
+  def theorem_9(i):
+    commits = setof(s.c, v in self.intact_set, received((_test_id, 'state', _i, _, s, _, _), from_=_v), s.phi == 'EXTERNALIZE')
+    prepared = setof(s.h, u in self.intact_set, received((_test_id, 'state', _i, _, s, _, _), from_=_u), s.phi == 'PREPARE', s.h.n != 0)
+    return not some(c in commits, q in prepared, has=q.gt_nc(c))
+
+  # THEOREM 11. If an intact node in an FBAS ⟨V, Q⟩ with quorum intersection con-
+  # firms a statement a, then, whatever subsequently transpires, once sufficient messages
+  # are delivered and processed, every intact node will accept and confirm a.
+  ## nominate x only - nodes stop at EXTERNALIZE so confirmed commit ranges never get the chance to spread
+  def theorem_11(i):
+    candidates = setof(x, v in self.intact_set, received((_test_id, 'state', _i, _, s, _, _), from_=_v), x in s.Z)
+    return each(x in candidates, n in self.intact_set, has=some((_n, s) in latest_states(i), has=x in s.Y and x in s.Z))
+
   # Theorem 12. Eventually, all intact nodes will have the same composite value.
   ## ?? paper's definition of intact nodes doesn't enforce quorum intersection...
   def theorem_12(i):
-    return len(setof(combine(s.Z), n in self.intact_set,
-      received((_test_id, 'state', _i, _, s, lc, _), from_=_n),
-      lc == maxof(lc2, received((_test_id, 'state', _i, _, _, lc2, _), from_=_n)))) <= 1
+    return len(setof(combine(s.Z), (_, s) in latest_states(i))) <= 1
 
   # THEOREM 13. Let ⟨V1, Q1⟩, … , ⟨Vk, Qk⟩ be the set of configurations an FBAS has
   # experienced during agreement on a single slot. Let V = V1 ∪ ⋯ ∪ Vk and Q(v) = { q ∣
@@ -108,19 +169,6 @@ class Checker(process, Client, NodeManager):
   # the slot, and v2 externalizes x2. If ⟨V, Q⟩B enjoys quorum intersection, then x1 = x2
   ## Assuming no ill-behaved nodes for now
   def theorem_13(i):
-    
-    Qs = setof((n, m[-1]), n in self.nodes.values(),
-      received((_test_id, 'state', _i, m, _, _, _), from_=_n)) | set(self.node_Ds.items())
-    
-    V_Q = {}
-    for v in setof(v, (v, _) in Qs):
-      Ds = setof(D, (_v, D) in Qs)
-      V_Q[v] = next(iter(Ds)) if len(Ds) == 1 else (1, frozenset(Ds))
-    
-    if not quorum.has_quorum_intersection(V_Q):
-      output(f'theorem_13({i}): no quorum intersection, inapplicable')
-      return True
-    
     return len(setof(x, (_, x) in externalized(i))) <= 1
 
   # THEOREM 14. In an FBAS with quorum intersection, if no intact node is in the
@@ -132,16 +180,12 @@ class Checker(process, Client, NodeManager):
 
     def first_fired_after(t_arm, n):
       return min(setof(t, v in self.intact_set, received((_test_id, 'fired', _i, n2, _, t), from_=_v), t > t_arm, n2 >= n) | {float('inf')})
-    
-    if not quorum.has_quorum_intersection(self.node_Ds):
-      output(f'theorem_14({i}): no quorum intersection, inapplicable')
-      return True
-    
-    return each(u in self.intact_set, has=
-      each(received((_test_id, 'armed', _i, n, _, t_arm), from_=_u), has=
-        some(v in self.intact_set, has=some(received((_test_id, 'state', _i, _, s, _, t), from_=_v), has=s.phi == 'EXTERNALIZE' and t <= t_arm))
-        or each(v in self.intact_set, has=
-          some(received((_test_id, 'state', _i, _, s, _, t), from_=_v), has=s.b.n >= n and t <= first_fired_after(t_arm, n)))))
+
+    return each(u in self.intact_set, received((_test_id, 'armed', _i, n, _, t_arm), from_=_u), has=
+      some(v in self.intact_set, has=externalized_before(i, v, t_arm))
+      or each(v in self.intact_set, has=
+        externalized_before(i, v, first_fired_after(t_arm, n))
+        or some(received((_test_id, 'state', _i, _, s, _, t), from_=_v), has=s.b.n >= n and t <= first_fired_after(t_arm, n))))
 
   # THEOREM 15. Given long enough timeouts, if an intact node has reached the CONFIRM
   # phase with b.x = x, then eventually all intact nodes will terminate
@@ -154,12 +198,39 @@ class Checker(process, Client, NodeManager):
   def theorem_16(i):
     return all_externalized(i)
 
+  ## commit b voted in PREPARE for c ≲ b ≲ h, and from CONFIRM on (prepare ⟨∞, b.x⟩) for every b ≳ c
+  def voted_commit(s, b):
+    return s.c.n != 0 and s.c.x == b.x and s.c.n <= b.n and (s.phi != 'PREPARE' or b.n <= s.h.n)
+
+  ## voting prepare b_v votes abort for every b ⋦ b_v, and from CONFIRM on b_v is ⟨∞, b_v.x⟩
+  def voted_abort(s, b):
+    return s.b.n != 0 and (s.phi != 'PREPARE' and s.b.x != b.x or s.b.gt_nc(b))
+
+  def voters(i, voted, b):
+    return setof(n, n in self.nodes.values(), some(received((_test_id, 'state', _i, _, s, _, _), from_=_n), has=voted(s, b)))
+
+  ## every value with every counter up to one past the highest finite one, plus ∞ - votes only change at those
+  def ballots(i):
+    states = setof(s, received((_test_id, 'state', _i, _, s, _, _)))
+    values = setof(x, s in states, x in {s.b.x, s.c.x}, x)
+    top = max(setof(n, s in states, n in {s.b.n, s.c.n, s.h.n}, n < INFINITY) | {0})
+    return setof(Ballot(n, x), x in values, n in set(range(1, top + 2)) | {INFINITY})
+
+  ## each intact node's state from its last message for slot i
+  def latest_states(i):
+    return setof((n, s), n in self.intact_set, received((_test_id, 'state', _i, _, s, lc, _), from_=_n),
+      lc == maxof(lc2, received((_test_id, 'state', _i, _, _, lc2, _), from_=_n)))
+
   def confirmed(i):
     return setof(v, v in self.intact_set, some(received((_test_id, 'state', _i, _, s, _, _), from_=_v), has=s.phi == 'CONFIRM'))
-
-  def all_externalized(i):
-    return each(n in self.intact_set, has=some((_n, _) in externalized(i)))
 
   def externalized(i):
     return setof((n, s.c.x), n in self.nodes.values(),
       received((_test_id, 'state', _i, _, s, _, _), from_=_n), s.phi == 'EXTERNALIZE')
+
+  def externalized_before(i, v, t):
+
+    return some(received((_test_id, 'state', _i, _, s, _, t2), from_=_v), has=s.phi == 'EXTERNALIZE' and t2 <= t)
+  def all_externalized(i):
+    return each(n in self.intact_set, has=some((_n, _) in externalized(i)))
+

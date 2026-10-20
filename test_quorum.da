@@ -4,10 +4,10 @@ import quorum
 from quorum_intersection import QuorumIntersectionChecker
 
 
-## builds one QuorumChecker2 seeded with v's own D, then learns every other node's D into
-## the same graph via add() - mirrors how scp.da incrementally learns peers' D's
+## builds one QuorumChecker seeded with v's own D, then learns every other node's D
+## via add() - mirrors how scp.da incrementally learns peers' D's
 def build_checker(v, node_specs):
-  qc = quorum.QuorumChecker2(v, node_specs[v])
+  qc = quorum.QuorumChecker(v, node_specs[v])
   for v2, D2 in node_specs.items():
     if v2 != v:
       qc.add(v2, D2)
@@ -36,7 +36,7 @@ class TestQuorumIntersection(unittest.TestCase):
       "Z": (1, {"Z"}),
     }
     self.assertFalse(quorum.has_quorum_intersection(specs))
-    U1, U2 = QuorumIntersectionChecker(quorum.quorum_graph(specs)).find_counterexample()
+    U1, U2 = QuorumIntersectionChecker(specs).find_counterexample()
     self.assertFalse(U1 & U2)
 
   def test_basic_4node_intersects(self):

@@ -4,6 +4,8 @@ from utils import hash_msg, replace_node_ids, log_to_file, archive_logs
 archive_logs() ## runs once, when this module is first imported, before any node starts writing this run's log file
 archive_logs('test_logs')
 
+GOSSIP = False
+
 class Node(process):
   def setup(peers, name, debugNames, log_file, logs_dir='logs', crashed=False):
     self.name = name
@@ -37,11 +39,11 @@ class Node(process):
       h = hash_msg(m)
       already_seen = h in gossip_known
       gossip_known.setdefault(h, set()).add(m[1])
-      sender, D = m[1], m[-1]
-      peers[sender] = D
-      for node in quorum.validators(D):
+      sender, sender_D = m[1], m[-1]
+      peers[sender] = sender_D
+      for node in quorum.validators(sender_D):
         peers.setdefault(node, None)
-      if not already_seen:
+      if GOSSIP and not already_seen:
         send(m, to=peers.keys() - {self, sender})
 
   def run():

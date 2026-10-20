@@ -3,57 +3,47 @@
 from ortools.sat.python import cp_model
 
 
+def is_nested(m):
+  return isinstance(m, tuple) and len(m) == 2
+
+def freeze(D):
+  t, members = D
+  return (t, frozenset(freeze(m) if is_nested(m) else m for m in members))
+
+def leaves(D):
+  return set().union(*(leaves(m) if is_nested(m) else {m} for m in D[1]))
+
 ## Checks whether an FBAS enjoys quorum intersection by searching for a counterexample:
 ## two disjoint, nonempty quorums. UNSAT means every pair of quorums intersects.
-## Takes the same quorum_graph shape as QuorumChecker2 (quorum.da): node -> top group id,
-## group id -> (threshold, children), discriminated by the 'grp:' prefix.
+## Takes Ds: node -> D, the same (threshold, members) trees quorum.da uses.
 class QuorumIntersectionChecker:
-  def __init__(self, quorum_graph: dict):
-    self.quorum_graph = quorum_graph
-    self.validators = sorted(self._all_leaves(quorum_graph))
-
-  ## every leaf ever mentioned, whether it has its own D (a quorum_graph key) or is only
-  ## referenced as a child inside some other node's group - e.g. an absent/"ghost" validator
-  @staticmethod
-  def _all_leaves(quorum_graph):
-    leaves = set()
-    for vertex, value in quorum_graph.items():
-      if vertex.startswith("grp:"):
-        _, children = value
-        leaves.update(c for c in children if not c.startswith("grp:"))
-      else:
-        leaves.add(vertex)
-    return leaves
+  def __init__(self, Ds: dict):
+    self.Ds = {v: freeze(D) for v, D in Ds.items()}
+    self.validators = sorted(set(self.Ds).union(*(leaves(D) for D in self.Ds.values())), key=str)
 
   ## adds one membership assignment (a candidate quorum) to the model, tagged by suffix
   ## so the two candidates get distinct variables. Returns {validator: BoolVar}.
   def _add_candidate(self, model, suffix):
     x = {v: model.new_bool_var(f"{v}{suffix}") for v in self.validators}
     for v in self.validators:
-      if self.quorum_graph.get(v) is None:
-        ## no D of its own - mirrors check_threshold(None, ...) == False in quorum.py,
-        ## so it can never actually belong to any quorum
+      if v not in self.Ds:
+        ## no D of its own, so it can never actually belong to any quorum
         model.add(x[v] == 0)
-    sat = {}  ## group id -> reified BoolVar, memoized like QuorumChecker2.check_threshold
+    sat = {}  ## nested D -> reified BoolVar, so a group shared by many nodes' Ds gets one variable
 
-    ## sat_var(v)=1 only *forces* enough children to hold - we never need the converse,
-    ## since v is only ever used on the right side of an implication (see below)
-    def sat_var(vertex):
-      if not vertex.startswith("grp:"):
-        return x[vertex]
-      if vertex in sat:
-        return sat[vertex]
-      threshold, children = self.quorum_graph[vertex]
-      terms = [sat_var(c) for c in children]
-      v = model.new_bool_var(f"{vertex}{suffix}")
-      model.add(sum(terms) >= threshold).only_enforce_if(v)
-      sat[vertex] = v
-      return v
+    ## sat_var(m)=1 only *forces* enough members to hold - we never need the converse,
+    ## since it's only ever used on the right side of an implication (see below)
+    def sat_var(m):
+      if not is_nested(m):
+        return x[m]
+      if m not in sat:
+        t, members = m
+        sat[m] = model.new_bool_var(f"g{len(sat)}{suffix}")
+        model.add(sum(sat_var(c) for c in members) >= t).only_enforce_if(sat[m])
+      return sat[m]
 
-    for name in self.validators:
-      top = self.quorum_graph.get(name)
-      if top is not None:
-        model.add_implication(x[name], sat_var(top))
+    for v, D in self.Ds.items():
+      model.add_implication(x[v], sat_var(D))
     model.add(sum(x.values()) >= 1)
     return x
 

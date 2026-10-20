@@ -25,12 +25,7 @@ class Ballot:
 
   ## Adding logic for comparing ballots as Python does not allow object comparisons by default
   def __lt__(self, other):
-    if self.n < other.n:
-      return True
-    elif self.n == other.n:
-      return self.x < other.x
-    else:
-      return False
+    return (self.n, tuple(sorted(self.x or ()))) < (other.n, tuple(sorted(other.x or ())))
 
   def __eq__(self, other):
     return self.n == other.n and self.x == other.x
@@ -56,10 +51,10 @@ class Ballot:
     return self.n >= other.n and self.x == other.x
 
   def lt_nc(self, other):
-    return self.n <= other.n and self.x != other.x
+    return self <= other and self.x != other.x
 
   def gt_nc(self, other):
-    return self.n >= other.n and self.x != other.x
+    return self >= other and self.x != other.x
 
 def extract_fields(msg):
     msg_type = msg[0]

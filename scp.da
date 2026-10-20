@@ -41,11 +41,10 @@ def neighbors(qc, peers, n, i):
   # neighbors(v, n) = { v2 | gi(N, n, v2) < h_max * weight(v, v2) }
   h_max = 2 ** 256  # Maximum value for a 256-bit hash
   N = 1 # N and P are constants to produce two different hash functions.
-  ## qc._slices_with's keys are exactly the validators appearing in some slice of qc.v's own
-  ## D (qc.weight is 0 for anything else) - the same candidate pool the old all_validators was;
-  ## peers gives us the str(id) -> real process id mapping back, since qc's graph is str-keyed
+  ## qc.members is every validator in qc.v's own D (qc.weight is 0 for anything else);
+  ## peers maps the str ids qc works in back to real process ids
   by_str = {str(p): p for p in peers}
-  return setof(by_str[v2], v2 in qc._slices_with, int(gi(i, 0, f"{N}:{n}:{v2}"), 16) < h_max * qc.weight(v2)) ## pass 0 in place of xi_minus_1 for now
+  return setof(by_str[v2], v2 in qc.members, int(gi(i, 0, f"{N}:{n}:{v2}"), 16) < h_max * qc.weight(v2)) ## pass 0 in place of xi_minus_1 for now
 
 def priority(n, v2):
   # priority(n, v2) = gi(P, n, v2)
@@ -64,7 +63,7 @@ class SCPNode(process, Node):
     super().setup(peers, name, debugNames, log_file, logs_dir, crashed)
     self.protocol_messages = PROTOCOL_MESSAGES
     self.state_per_slot = dict()  ## To maintain the state per slot #? should this be a set instead of dict?
-    self.qc = quorum.QuorumChecker2(str(self), D) ## qc builds and owns its own quorum_graph
+    self.qc = quorum.QuorumChecker(str(self), D)
     ## map of peers (node ids and their quorum config) based on quorum slices
     for node in quorum.validators(D):
       self.peers[node] = None
@@ -76,8 +75,7 @@ class SCPNode(process, Node):
   def receive(msg=m):
     if self.crashed: return
     if m[0] in self.protocol_messages:
-      sender, D = m[1], m[-1]
-      self.qc.add(str(sender), D)
+      self.qc.add(str(m[1]), m[-1])
 
   def receive(msg=('TRANSACTION', i, value)):
     if self.crashed: return
@@ -177,21 +175,27 @@ class SCPNode(process, Node):
   def accepted_nominate(state, x):
     return setof(str(v), (v, _, Ym, _) in nominations(state), _x in Ym)
 
+  # Definition (accept). An FBAS node v accepts a statement a iff it has never accepted
+  # a statement contradicting a and it determines that either
+  # (1) There exists a quorum U such that v ∈ U and each member of U either voted for
+  # a or claims to accept a, or
+  # (2) Each member of a v-blocking set claims to accept a
   def accepts_nominate(state, x):
     return qc.quorum(voted_nominate(state, x)) or qc.v_blocking(accepted_nominate(state, x))
 
+  # Definition (confirm). A quorum U_a in an FBAS confirms a statement a iff ∀v ∈ U_a,
+  # v claims to accept a. A node confirms a iff it is in such a quorum.
   def confirms_nominate(state, x):
     return qc.quorum(accepted_nominate(state, x))
 
   # Fig. 17. Messages in SCP’s ballot protocol
-
   def send_message(state):
     # Once z ≠ ⊥, if b.n = 0, a node
     # reinitializes b to ⟨1, z⟩ to start sending messages. Nodes then repeatedly exchange
     # messages with peers, sending whichever ballot message is indicated by phi.
     if not state.z: return
-    if state.b.n == 0:
-      state.b = Ballot(n=1, x=state.z)
+    if state.b.n == 0 or not state.b.x:
+      state.b = Ballot(n=max(state.b.n, 1), x=state.z)
 
     if state.phi == 'PREPARE':
       # PREPARE v i b p p2 c.n h.n D
@@ -235,7 +239,9 @@ class SCPNode(process, Node):
       ## confirm b represents prepare INFINITY, b.x which counts as a vote to prepare all compatible ballots
       | setof(str(vm), ('CONFIRM', vm, _, f, _) in state.M, (bm, _, _, _) in {f}, bm.x == ballot.x)
       ## externalize x represents prepare INFINITY, x which counts as a vote to prepare all compatible ballots
-      | setof(str(vm), ('EXTERNALIZE', vm, _, f, _) in state.M, (xm, _, _) in {f}, xm == ballot.x))
+      | setof(str(vm), ('EXTERNALIZE', vm, _, f, _) in state.M, (xm, _, _) in {f}, xm == ballot.x)
+      ## accepting also counts toward the quorum in accept's clause (1)
+      | accepted_prepare(state, ballot))
 
   def accepted_prepare(state, ballot):
     ## all nodes with prepare p or p2 greater than and compatible with this ballot have accepted this ballot as prepared
@@ -246,8 +252,10 @@ class SCPNode(process, Node):
       | setof(str(vm), ('EXTERNALIZE', vm, _, f, _) in state.M, (xm, _, _) in {f}, xm == ballot.x))
 
   def accepts_prepare(state, ballot):
-    accepted = accepted_prepare(state, ballot)
-    return qc.quorum(voted_prepare(state, ballot) | accepted) or qc.v_blocking(accepted)
+    return qc.quorum(voted_prepare(state, ballot)) or qc.v_blocking(accepted_prepare(state, ballot))
+
+  def confirms_prepare(state, ballot):
+    return qc.quorum(accepted_prepare(state, ballot))
 
   def voted_commit(state, ballot):
     ## all nodes with prepare b, c, h represent the below vote commit for a ballot between c and h
@@ -256,7 +264,9 @@ class SCPNode(process, Node):
       ## confirm implies prepare b, c, INFINITY, all nodes with c less than ballot vote commit on ballot
       | setof(str(vm), ('CONFIRM', vm, _, f, _) in state.M, (bm, _, c_nm, _) in {f}, bm.x == ballot.x, c_nm <= ballot.n)
       ## externalize implies the same as above
-      | setof(str(vm), ('EXTERNALIZE', vm, _, f, _) in state.M, (xm, c_nm, _) in {f}, xm == ballot.x, c_nm <= ballot.n))
+      | setof(str(vm), ('EXTERNALIZE', vm, _, f, _) in state.M, (xm, c_nm, _) in {f}, xm == ballot.x, c_nm <= ballot.n)
+      ## accepting also counts toward the quorum in accept's clause (1)
+      | accepted_commit(state, ballot))
 
   def accepted_commit(state, ballot):
     ## all nodes with confirm b, c, h represent below accept commit for ballot between c and h
@@ -265,16 +275,20 @@ class SCPNode(process, Node):
       ## externalize x, c implies confirm b, c, INFINITY, all nodes with c less than ballot accepted commit for it
       | setof(str(vm), ('EXTERNALIZE', vm, _, f, _) in state.M, (xm, c_nm, _) in {f}, xm == ballot.x, c_nm <= ballot.n))
 
+  # For a given ballot, commit and abort are contradictory, so a well-behaved node may vote for at most one
+  # of them.
+  # Definition (prepared). A ballot b is prepared iff every statement in the following set
+  # is true: { abort b_old ∣ b_old ⋦ b }.
+  ## accepting p (or p2) prepared accepts abort b for every b ⋦ p
+  def contradicts_commit(state, ballot):
+    return state.p.gt_nc(ballot) or state.p2.gt_nc(ballot)
+
   def accepts_commit(state, ballot):
-    # Definition (accept). An FBAS node v accepts a statement a iff it has never accepted
-    # a statement contradicting a and it determines that either
-    # (1) There exists a quorum U such that v ∈ U and each member of U either voted for
-    # a or claims to accept a, or
-    # (2) Each member of a v-blocking set claims to accept a.
-    ## accepting p (or p2) prepared means accepting abort for everything ⋦ p, which contradicts commit
-    if state.p.gt_nc(ballot) or state.p2.gt_nc(ballot): return False
-    accepted = accepted_commit(state, ballot)
-    return qc.quorum(voted_commit(state, ballot) | accepted) or qc.v_blocking(accepted)
+    if contradicts_commit(state, ballot): return False
+    return qc.quorum(voted_commit(state, ballot)) or qc.v_blocking(accepted_commit(state, ballot))
+
+  def confirms_commit(state, ballot):
+    return qc.quorum(accepted_commit(state, ballot))
 
   ## v accepts all { commit b2 ∣ lo ≲ b2 ≲ hi }
   def accepts_commit_range(accepted, points, lo, hi):
@@ -365,9 +379,7 @@ class SCPNode(process, Node):
 
       # (2) If phi = PREPARE and m lets v confirm new higher ballots prepared, then raise h
       # to the highest such ballot and set z to h.x.
-      confirm_candidates = setof(ballot, ballot in prepare_points(state),
-                          ballot > state.h,
-                          qc.quorum(accepted_prepare(state, ballot)))
+      confirm_candidates = setof(ballot, ballot in prepare_points(state), ballot > state.h, confirms_prepare(state, ballot))
 
       if confirm_candidates:
         state.h = max(confirm_candidates)
@@ -412,7 +424,7 @@ class SCPNode(process, Node):
 
       # (7) If phi = CONFIRM and v confirms commit c2 for any c2, set c and h to the lowest and
       # highest such ballots, set phi to EXTERNALIZE, externalize c.x, and terminate.
-      confirmed = setof(c2, c2 in points, qc.quorum(accepted_commit(state, c2)))
+      confirmed = setof(c2, c2 in points, confirms_commit(state, c2))
       if confirmed:
         state.c, state.h = min(confirmed), max(confirmed)
         state.phi = 'EXTERNALIZE'
