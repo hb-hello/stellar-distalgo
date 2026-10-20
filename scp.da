@@ -11,6 +11,7 @@
 ## our own comments, e.g., needed to run, chose @s vs #c
 
 import time
+from threading import Timer
 import hashlib
 from datetime import datetime
 from state import Ballot, State, INFINITY
@@ -68,8 +69,7 @@ class SCPNode(process, Node):
     for node in quorum.validators(D):
       self.peers[node] = None
     self.peers[self] = D
-    self.timers = {} ## (slot, kind) -> (deadline, b.n when armed)
-    self.timers_changed = False
+    self.ballot_timer_n = {} ## slot -> b.n when ballot timer armed
     # output(f'Node {self} initialized with quorum slices: {D} and peers: {self.peers}')
 
   def receive(msg=m):
@@ -228,8 +228,8 @@ class SCPNode(process, Node):
     # (a) A node v with phi_v ≠ EXTERNALIZE arms a timer whenever ∃S ⊆ M_v such that
     # the set of senders U = { v_m ∣ m ∈ S } is a quorum, v ∈ U, and ∀m ∈ S, b_m.n ≥ b_v.n.
     U = setof(str(vm), (t, vm, _, f, _) in state.M, (INFINITY if t == 'EXTERNALIZE' else f[0].n) >= state.b.n)
-    armed = self.timers.get((state.slot, 'ballot'))
-    if state.phi != 'EXTERNALIZE' and not (armed and armed[1] == state.b.n) and str(self) in U and qc.quorum(U):
+    if state.phi != 'EXTERNALIZE' and self.ballot_timer_n.get(state.slot) != state.b.n and str(self) in U and qc.quorum(U):
+      self.ballot_timer_n[state.slot] = state.b.n
       arm_timer(state, 'ballot', TIMEOUT * state.b.n)
 
   
@@ -446,12 +446,14 @@ class SCPNode(process, Node):
         update_state(state)
   
   def arm_timer(state:State, kind, duration):
-    if kind == 'ballot': log(f'{self} armed ballot timer at b={state.b} for slot {state.slot}')
-    self.timers[(state.slot, kind)] = (time.time() + duration, state.b.n)
-    self.timers_changed = True
+    t = Timer(duration, send, args=(('timeout', state.slot, kind, state.b.n),), kwargs={'to': {self}})
+    t.daemon = True
+    t.start()
 
-  def cancel_timer(state:State, kind):
-    self.timers.pop((state.slot, kind), None)
+  def receive(msg=('timeout', i, kind, n), from_=self):
+    state = self.state_per_slot[i]
+    if kind == 'nomination': increment_n(state)
+    elif state.phi != 'EXTERNALIZE' and state.b.n == n: increment_ballot(state)
 
   def increment_ballot(state:State):
     # (b) If the timer fires, v updates its ballot by setting b_v ← ⟨b_v.n + 1, z_v⟩.
@@ -460,18 +462,7 @@ class SCPNode(process, Node):
     send_message(state)
 
   def run():
-    while True:
-      deadline = min(setof(d, (_, (d, _)) in self.timers.items()) | {time.time() + TIMEOUT})
-      self.timers_changed = False
-      if await(self.timers_changed):
-        pass
-      elif timeout(max(0, deadline - time.time())):
-        now = time.time()
-        for ((i, kind), (d, n)) in setof(t, t in self.timers.items(), t[1][0] <= now):
-          state = self.state_per_slot[i]
-          cancel_timer(state, kind)
-          if kind == 'nomination': increment_n(state)
-          elif state.phi != 'EXTERNALIZE' and state.b.n == n: increment_ballot(state)
+    await(False)
 
 class Client(process):
   def setup(nodes:dict):
