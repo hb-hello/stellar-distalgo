@@ -39,7 +39,7 @@ class SCPNodeX(process, SCPNode):
 
   def run():
     send(('ready',), to={ checker })
-    await(False)
+    super().run()
 
 class Checker(process, Client, NodeManager):
   def setup(name):

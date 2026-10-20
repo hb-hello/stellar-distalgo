@@ -70,6 +70,8 @@ class SCPNode(process, Node):
     for node in setof(n, (_, v) in D[1], n in v):
       self.peers[node] = None
     self.peers[self] = D
+    self.timers = {} ## (slot, kind) -> (deadline, b.n when armed)
+    self.timers_changed = False
     # output(f'Node {self} initialized with quorum slices: {D} and peers: {self.peers}')
 
   def receive(msg=m):
@@ -83,10 +85,9 @@ class SCPNode(process, Node):
     # This is a message from a client adding a value for slot i.
     is_new_slot = i not in self.state_per_slot
     state = self.state_per_slot.setdefault(i, State(i, self.D)) ## retrieve or initialize the state for mentioned slot
-    if state.v_n is None: state.v_n = max_priority_neighbor(self.qc, self.peers, state.n, state.slot)
     if update_nomination_state(state):
       send_nomination(state)
-    if is_new_slot: search_leader(state)
+    if is_new_slot: arm_timer(state, 'nomination', TIMEOUT)
 
   def send_nomination(state:State):
     # NOMINATE v i X Y D
@@ -98,46 +99,26 @@ class SCPNode(process, Node):
     msg = ('NOMINATE', self, state.slot, frozenset(state.X), frozenset(state.Y), self.D)
     send(msg, to=self.peers.keys() - {self}, withLog=f'{self} nominating with X={state.X}, Y={state.Y} for slot {1 if state.slot is True else state.slot}, round {state.n}')
 
-  def search_leader(state:State):
-    ## keep trying to nominate new values by incrementing the round number (n)
-    #? each slot will have its own while loop running
-    while True:
-      if await(state.X):
-        break
-      elif timeout(TIMEOUT):
-        increment_n(state, self.qc, self.peers) ## increment nomination round number for this slot
-        if update_nomination_state(state): send_nomination(state) ## send nomination request message to peers for this slot based on updated n
-    # highest-priority node can optimistically initiate balloting at the same time as nom-
-    # ination, piggybacking its first ballot message PREPARE (described below) on its first
-    # NOMINATE message.
-    if state.v_n == self: send_message(state)
-    await_candidate(state)
-
-  def await_candidate(state:State):
+  def increment_n(state:State):
     # v should use timeouts to decide on new nominate statements to vote for. After n timeouts, v should
     # find a node v_n ∈ neighbors(v, n) maximizing priority(n, v_n) and vote to nominate every-
     # thing v_n has voted to nominate
     # As soon as v has a candidate value, however, it must cease voting to nominate x
     # for any new values x
-    while True:
-      if await(state.Z):
-        break
-      elif timeout(TIMEOUT):
-        increment_n(state, self.qc, self.peers) ## increment nomination round number for this slot
-        if update_nomination_state(state): send_nomination(state) ## send nomination request message to peers for this slot based on updated n
-    log(f'{self} now has candidate value Z={state.Z} for slot {state.slot}')
-    send_message(state)
-    await_externalize(state)
-
-  def increment_n(state:State, qc, peers):
+    if state.Z: return
+    ## keep trying to nominate new values by incrementing the round number (n)
     state.n += 1
-    state.v_n = max_priority_neighbor(qc, peers, state.n, state.slot)
+    state.v_n = max_priority_neighbor(self.qc, self.peers, state.n, state.slot)
+    if update_nomination_state(state): send_nomination(state) ## send nomination request message to peers for this slot based on updated n
+    arm_timer(state, 'nomination', TIMEOUT)
 
   def update_nomination_state(state:State):
     # Each node v should initially find a node v0 ∈ neighbors(v, 0) that maximizes
     # priority(0, v0) among nodes it can communicate with, then vote to nominate the same
     # values as v0. Only if v = v0 should v introduce a new value to nominate.
+    if state.v_n is None: state.v_n = max_priority_neighbor(self.qc, self.peers, state.n, state.slot)
     ## new value to nominate is picked from transactions received
+    had_X, had_Z = bool(state.X), bool(state.Z)
     if state.v_n == self:
       state.X |= setof(x, received(('TRANSACTION', state.slot, x))) ## adding new values to vote for nominations
     else:
@@ -164,13 +145,21 @@ class SCPNode(process, Node):
     if state.h.n == 0:
       state.z = combine(state.Z) if state.Z else (combine(state.Y) if state.Y else combine(state.X))
 
+    # highest-priority node can optimistically initiate balloting at the same time as nom-
+    # ination, piggybacking its first ballot message PREPARE (described below) on its first
+    # NOMINATE message.
+    if not had_X and state.X and state.v_n == self: send_message(state)
+
+    if not had_Z and state.Z:
+      log(f'{self} now has candidate value Z={state.Z} for slot {state.slot}')
+      send_message(state)
+
     return state.add_nomination(self, frozenset(state.X), frozenset(state.Y), self.D)
 
   def receive(msg=('NOMINATE', sender, i, X, Y, D)):
     if self.crashed: return
     is_new_slot = i not in self.state_per_slot
     state = self.state_per_slot.setdefault(i, State(i, self.D)) ## retrieve the state for mentioned slot
-    if state.v_n is None: state.v_n = max_priority_neighbor(self.qc, self.peers, state.n, state.slot)
 
     ## Ignore if this is not a new nomination message
     if not state.add_nomination(sender, X, Y, D): return
@@ -186,7 +175,7 @@ class SCPNode(process, Node):
     #c nodes broadcast their state whenever there is an update in state
     if update_nomination_state(state):
       send_nomination(state)
-    if is_new_slot: search_leader(state)
+    if is_new_slot: arm_timer(state, 'nomination', TIMEOUT)
 
   # Fig. 17. Messages in SCP’s ballot protocol
 
@@ -223,6 +212,15 @@ class SCPNode(process, Node):
       msg = ('EXTERNALIZE', self, state.slot, (state.b.x, state.c.n, state.h.n), self.D)
       if state.add_message(msg):
         send(msg, to=self.peers.keys() - {self})
+
+    ## In section 6.2.2 in the paper
+    # For this reason, nodes employ a timer as follows:
+    # (a) A node v with phi_v ≠ EXTERNALIZE arms a timer whenever ∃S ⊆ M_v such that
+    # the set of senders U = { v_m ∣ m ∈ S } is a quorum, v ∈ U, and ∀m ∈ S, b_m.n ≥ b_v.n.
+    U = setof(str(vm), (t, vm, _, f, _) in state.M, (INFINITY if t == 'EXTERNALIZE' else f[0].n) >= state.b.n)
+    armed = self.timers.get((state.slot, 'ballot'))
+    if state.phi != 'EXTERNALIZE' and not (armed and armed[1] == state.b.n) and str(self) in U and qc.quorum(U):
+      arm_timer(state, 'ballot', TIMEOUT * state.b.n)
 
   
   def voted_prepare(state, ballot):
@@ -430,25 +428,13 @@ class SCPNode(process, Node):
         state.b = Ballot(n, state.z)
         update_state(state)
   
-  ## In section 6.2.2 in the paper
-  # For this reason, nodes employ a timer as follows:
-  def await_externalize(state:State):
-    # (a) A node v with phi_v ≠ EXTERNALIZE arms a timer whenever ∃S ⊆ M_v such that
-    # the set of senders U = { v_m ∣ m ∈ S } is a quorum, v ∈ U, and ∀m ∈ S, b_m.n ≥ b_v.n.
-    while True:
-      if await(state.phi == 'EXTERNALIZE'):
-        break
-      elif await(str(self) in setof(str(vm), (t, vm, _, f, _) in state.M, (INFINITY if t == 'EXTERNALIZE' else f[0].n) >= state.b.n)
-                 and qc.quorum(setof(str(vm), (t, vm, _, f, _) in state.M, (INFINITY if t == 'EXTERNALIZE' else f[0].n) >= state.b.n))):
-        n = state.b.n
-        timer_armed(state)
-        if await(state.phi == 'EXTERNALIZE' or state.b.n != n):
-          continue
-        elif timeout(TIMEOUT * n):
-          increment_ballot(state)
+  def arm_timer(state:State, kind, duration):
+    if kind == 'ballot': log(f'{self} armed ballot timer at b={state.b} for slot {state.slot}')
+    self.timers[(state.slot, kind)] = (time.time() + duration, state.b.n)
+    self.timers_changed = True
 
-  def timer_armed(state:State):
-    log(f'{self} armed ballot timer at b={state.b} for slot {state.slot}')
+  def cancel_timer(state:State, kind):
+    self.timers.pop((state.slot, kind), None)
 
   def increment_ballot(state:State):
     # (b) If the timer fires, v updates its ballot by setting b_v ← ⟨b_v.n + 1, z_v⟩.
@@ -477,6 +463,20 @@ class SCPNode(process, Node):
 
   def fbas_confirmed(state, stmt):
     return stmt in state.fbas_confirmed
+
+  def run():
+    while True:
+      deadline = min(setof(d, (_, (d, _)) in self.timers.items()) | {time.time() + TIMEOUT})
+      self.timers_changed = False
+      if await(self.timers_changed):
+        pass
+      elif timeout(max(0, deadline - time.time())):
+        now = time.time()
+        for ((i, kind), (d, n)) in setof(t, t in self.timers.items(), t[1][0] <= now):
+          state = self.state_per_slot[i]
+          cancel_timer(state, kind)
+          if kind == 'nomination': increment_n(state)
+          elif state.phi != 'EXTERNALIZE' and state.b.n == n: increment_ballot(state)
 
 class Client(process):
   def setup(nodes:dict):
